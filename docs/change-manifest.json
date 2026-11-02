@@ -1,0 +1,35 @@
+{
+  "changed_files": [
+    ".env.example",
+    "README.md",
+    "app/__init__.py",
+    "app/__main__.py",
+    "app/bot/interface.py",
+    "app/bot/labels.py",
+    "app/bot/runtime.py",
+    "app/config.py",
+    "app/db/database.py",
+    "app/scheduler/worker.py",
+    "app/security/secrets.py",
+    "app/services/accounts.py",
+    "app/services/autoresponders.py",
+    "app/services/campaigns.py",
+    "app/services/chat_pool.py",
+    "app/services/core.py",
+    "app/services/dispatch.py",
+    "app/services/greetings.py",
+    "app/services/notifications.py",
+    "app/services/onboarding.py",
+    "app/services/pairs.py",
+    "app/services/statistics.py",
+    "app/transport/base.py",
+    "app/transport/telegram.py",
+    "pyproject.toml",
+    "tests/test_acceptance.py"
+  ],
+  "new_app_modules": [
+    "app/transport/session.py"
+  ],
+  "deleted_app_modules": [],
+  "snapshot_sha256": "5cdc14b606d9e7ef3f7980bf58f59dc6dfdd9ee2552be242ce05262ad313cf72"
+}

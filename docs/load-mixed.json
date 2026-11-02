@@ -1,0 +1,36 @@
+{
+  "accounts": 1000,
+  "chats": 10000,
+  "historical_results": 200000,
+  "planning": {
+    "wall_seconds": 3.2436,
+    "cpu_seconds": 2.5625,
+    "python_peak_mb": 0.073
+  },
+  "statistics": {
+    "wall_seconds": 3.002,
+    "cpu_seconds": 3.0156,
+    "python_peak_mb": 3.308
+  },
+  "statistics_confirmed": 200000,
+  "processing": {
+    "wall_seconds": 16.2397,
+    "cpu_seconds": 7.1719,
+    "confirmed": 1000,
+    "duplicates": 0,
+    "max_concurrency": 3,
+    "restart_performed": true,
+    "concurrent_statistics_and_planning": true,
+    "event_loop_lag_max_ms": 15.211
+  },
+  "sqlite_integrity": "ok",
+  "sqlite_fk_errors": 0,
+  "python": "3.11.0",
+  "cpu_logical": 12,
+  "mock_rpc_latency_seconds": 0.02,
+  "memory": {
+    "rss_mb": 35.23,
+    "process_peak_rss_mb": 97.84
+  },
+  "app_version": "2.0.1"
+}

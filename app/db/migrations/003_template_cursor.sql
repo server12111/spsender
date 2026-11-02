@@ -1,0 +1,1 @@
+ALTER TABLE campaigns ADD COLUMN template_cursor INTEGER NOT NULL DEFAULT 0;

@@ -1,0 +1,27 @@
+{
+  "version": "2.0.1",
+  "database": "SQLite",
+  "sqlite_version": "3.38.4",
+  "python_tested": "3.11.0",
+  "tests": 128,
+  "wheel_tests": 128,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "real_target_operations": 0,
+  "original_archive_sha256": "29b3680277bc8e8716b4a7e32fb5da14ad2491608202e6bce0b96e36f7be0495",
+  "wheel_sha256": "b2778def19ccae865c5e8e7bf0006a29937fe0e27705b272036a5134c37f8f53",
+  "wheel_source_parity": "verified",
+  "installed_wheel_smoke": "passed",
+  "public_functions_retained": "verified",
+  "ruff": "passed",
+  "compileall": "passed",
+  "pip_check": "passed",
+  "live_telegram": "not run",
+  "load_reports": [
+    "load-before.json",
+    "load-after.json",
+    "load-large.json",
+    "load-mixed.json"
+  ]
+}

@@ -1,14 +1,15 @@
-.venv/
 .env
-*.db
-*.db-*
+.venv/
 __pycache__/
+*.pyc
 .pytest_cache/
 .ruff_cache/
-*.tmp
-*.egg-info/
-backups/
-data/
-node_modules/
+/data/
 dist/
+build/
+.audit/
+*.session*
+*.db*
+*.sqlite*
+*.egg-info/
 

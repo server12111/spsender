@@ -1,11 +1,13 @@
+name: fe-autosender
 services:
-  app:
+  bot:
     build: .
     restart: unless-stopped
     env_file: .env
-    ports:
-      - 127.0.0.1:8000:8000
+    environment:
+      DATABASE_PATH: /srv/fe-autosender/data/fe_autosender.sqlite3
     volumes:
-      - smena_data:/app/data
+      - autosender_data:/srv/fe-autosender/data
+    stop_grace_period: 30s
 volumes:
-  smena_data:
+  autosender_data:
