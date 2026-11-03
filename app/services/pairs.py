@@ -25,6 +25,8 @@ class Pairs:
         return [row(c, "SELECT * FROM accounts WHERE id=?", (pair[key],)) for key in ("account_a_id", "account_b_id")]
 
     def _pair_ready(self, c, pair):
+        if self._rotation_pair_blocked(c, pair["id"]):
+            return False
         if row(c, "SELECT 1 FROM dispatch_jobs WHERE pair_id=? AND status='UNKNOWN'", (pair["id"],)):
             return False
         accounts = self._pair_accounts(c, pair)

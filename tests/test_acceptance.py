@@ -419,7 +419,7 @@ def test_27_migrations_and_packaged_smoke(env):
     e.db.migrate()
     assert e.db.scalar("PRAGMA integrity_check") == "ok"
     assert not e.db.all("PRAGMA foreign_key_check")
-    assert e.db.scalar("SELECT count(*) FROM schema_migrations") == 8
+    assert e.db.scalar("SELECT count(*) FROM schema_migrations") == 9
     from app.__main__ import smoke
 
     asyncio.run(smoke())

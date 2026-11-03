@@ -471,6 +471,7 @@ class Interface:
                 ],
                 [
                     b("💬 Автоответы", "templates_hub", {"section": "auto"}),
+                    b("🔄 Обмен чатов", "rotation"),
                 ],
                 [
                     b(
@@ -699,6 +700,112 @@ class Interface:
         )
         text += "\n\nФайловый журнал: data/logs/diagnostics.log (ротация 3 × 5 МБ)."
         return View(text[:3900], self.nav(user, "errors"))
+
+    def rotation_view(self, user, campaign_id, page=0):
+        self.e.authorize(user)
+        record = self.e.rotation_card(campaign_id, page)
+        campaign = record["campaign"]
+        enabled = bool(campaign["rotation_enabled"])
+        text = (
+            f"🔄 Обмен чатов · {campaign['name']}\n{'Включён' if enabled else 'Выключен'} · раз в 7 дней\n"
+            f"Следующий: {self.time(campaign['rotation_next_at']) if enabled else '—'}\n"
+            f"Подготовка за {campaign['rotation_lead_days']} дня · сообщений на аккаунт в чат: {campaign['rotation_messages']}\n\n"
+            "Аккаунты в парах, тексты и смены A/B сохраняются. Меняются только наборы чатов внутри этой рассылки. "
+            "Непарный остаток не участвует. Неготовый обмен пропускается.\n\n"
+            f"Автоподписки по требованиям ботов группы: {'включены' if campaign['auto_subscribe'] else 'выключены'}. "
+            "CAPTCHA и опросы — вручную."
+        )
+        buttons = [
+            [
+                self.button(
+                    user,
+                    "⏸ Выключить обмен" if enabled else "▶️ Включить обмен",
+                    "rotation_toggle",
+                    {"id": campaign_id, "enabled": not enabled, "expected": enabled},
+                    True,
+                )
+            ],
+            [
+                self.button(user, "⏳ Срок подготовки", "form", {"id": campaign_id, "field": "rotation_lead"}),
+                self.button(user, "📝 Сообщений 0–2", "form", {"id": campaign_id, "field": "rotation_messages"}),
+            ],
+            [
+                self.button(
+                    user,
+                    "🔗 Автоподписки: " + ("вкл" if campaign["auto_subscribe"] else "выкл"),
+                    "option",
+                    {
+                        "id": campaign_id,
+                        "field": "auto_subscribe",
+                        "value": not campaign["auto_subscribe"],
+                        "v": campaign["version"],
+                        "return": "rotation",
+                    },
+                    True,
+                )
+            ],
+        ]
+        failed_memberships = self.e.db.scalar(
+            "SELECT count(*) FROM membership_requests WHERE campaign_id=? AND status='FAILED'", (campaign_id,)
+        )
+        if failed_memberships:
+            buttons.append(
+                [
+                    self.button(
+                        user,
+                        f"🔁 Повторить подписки ({failed_memberships})",
+                        "membership_retry",
+                        {"id": campaign_id},
+                        True,
+                    )
+                ]
+            )
+        for exchange in record["exchanges"][:6]:
+            text += f"\n\n№{exchange['id']} · Пары {exchange['left_pair_id']} ↔ {exchange['right_pair_id']} · {label(exchange['status'])}"
+            buttons.append(
+                [self.button(user, f"🔎 Обмен №{exchange['id']}", "rotation_detail", {"id": exchange["id"]})]
+            )
+        self.pagination(buttons, user, "rotation", {"id": campaign_id}, page, len(record["exchanges"]) > 6)
+        return View(
+            text[:3900],
+            buttons + [[self.button(user, "📣 Рассылка", "card", {"id": campaign_id, "section": "campaigns"})]],
+        )
+
+    def rotation_detail(self, user, exchange_id, page=0):
+        self.e.authorize(user)
+        exchange = self.e.db.one(
+            "SELECT x.*,r.campaign_id,r.due_at FROM rotation_exchanges x JOIN rotation_cycles r "
+            "ON r.id=x.cycle_id WHERE x.id=?",
+            (exchange_id,),
+        )
+        if not exchange:
+            raise DomainError("Обмен не найден")
+        progress = self.e.db.all(
+            "SELECT p.*,t.chat_pool_id,cp.title FROM rotation_progress p JOIN rotation_targets t ON t.id=p.target_id "
+            "JOIN chat_pool cp ON cp.id=t.chat_pool_id WHERE t.exchange_id=? ORDER BY p.id LIMIT 9 OFFSET ?",
+            (exchange_id, max(0, page) * 8),
+        )
+        text = f"🔄 Обмен №{exchange_id} · {label(exchange['status'])}\nДата: {self.time(exchange['due_at'])}\n"
+        for item in progress[:8]:
+            text += (
+                f"\nАккаунт №{item['account_id']} → {item['title'][:45]}\n"
+                f"Вступил: {'да' if item['joined'] else 'нет'} · Права: {'да' if item['can_write'] else 'ожидание'} · "
+                f"Сообщений: {item['message_index']}"
+                + (f" · {label(item['last_error'])}" if item["last_error"] else "")
+                + "\n"
+            )
+        buttons = []
+        if exchange["status"] in {"PREPARING", "READY"}:
+            buttons.append(
+                [
+                    self.button(
+                        user, "✅ Проверено вручную: повторить подготовку", "rotation_retry", {"id": exchange_id}, True
+                    )
+                ]
+            )
+        self.pagination(buttons, user, "rotation_detail", {"id": exchange_id}, page, len(progress) > 8)
+        buttons.append([self.button(user, "◀️ Обмен чатов", "rotation", {"id": exchange["campaign_id"]})])
+        return View(text[:3900], buttons)
 
     def issues(self, user, page=0, records=None):
         if records is None:
@@ -981,6 +1088,27 @@ class Interface:
         action, data = token["action"], json.loads(token["data"])
         await self.e.db.run(self._expect_version, data)
         section, item_id = data.get("section"), data.get("id")
+        if action == "rotation":
+            return await self.e.db.run(self.rotation_view, user, item_id, data.get("page", 0))
+        if action == "rotation_detail":
+            return await self.e.db.run(self.rotation_detail, user, item_id, data.get("page", 0))
+        if action == "rotation_toggle":
+            campaign = await self.e.db.run(self.e.db.one, "SELECT * FROM campaigns WHERE id=?", (item_id,))
+            await self.e.db.run(
+                self.e.set_rotation,
+                item_id,
+                data["enabled"],
+                campaign["rotation_lead_days"],
+                campaign["rotation_messages"],
+                expected_enabled=data["expected"],
+            )
+            return await self.e.db.run(self.rotation_view, user, item_id)
+        if action == "rotation_retry":
+            await self.e.db.run(self.e.retry_rotation, item_id)
+            return await self.e.db.run(self.rotation_detail, user, item_id)
+        if action == "membership_retry":
+            await self.e.db.run(self.e.retry_memberships, item_id)
+            return await self.e.db.run(self.rotation_view, user, item_id)
         if action == "stats_details":
             return await self.e.db.run(self.stats, user, data.get("period", "today"), data.get("details", True))
         if action == "queue_settings":
@@ -1044,6 +1172,8 @@ class Interface:
                 "reply_cooldown": "Cooldown ответов в секундах",
                 "dm_greeting_phrase": "Короткое приветствие для ЛС (до 200 символов)",
                 "dm_sticker_emoji": "Эмодзи для выбора стикера Telegram, например 👋",
+                "rotation_lead": "За сколько дней готовиться к обмену: 1–6 (обычно 3)",
+                "rotation_messages": "Сколько сообщений того же текста отправить заранее: 0–2 на аккаунт в чат",
             }
             return View(
                 "Шаг 1 из 1\n"
@@ -1106,6 +1236,8 @@ class Interface:
             await self.e.db.run(
                 self.e.edit_campaign, item_id, expected_version=data.get("v"), **{data["field"]: data["value"]}
             )
+            if data.get("return") == "rotation":
+                return await self.e.db.run(self.rotation_view, user, item_id)
             return (
                 await self.e.db.run(self.templates_hub, user, item_id, data["return"])
                 if "return" in data
@@ -1581,7 +1713,17 @@ class Interface:
             return await self.e.db.run(self.listing, user, form["section"], search=text.strip())
         if name == "form":
             field, item_id = form["field"], form.get("id")
-            if field in {"timezone", "join_pause"} or field in RUNTIME_LIMITS:
+            if field in {"rotation_lead", "rotation_messages"}:
+                campaign = await self.e.db.run(self.e.db.one, "SELECT * FROM campaigns WHERE id=?", (item_id,))
+                await self.e.db.run(
+                    self.e.set_rotation,
+                    item_id,
+                    campaign["rotation_enabled"],
+                    int(text) if field == "rotation_lead" else campaign["rotation_lead_days"],
+                    int(text) if field == "rotation_messages" else campaign["rotation_messages"],
+                )
+                result = await self.e.db.run(self.rotation_view, user, item_id)
+            elif field in {"timezone", "join_pause"} or field in RUNTIME_LIMITS:
                 await self.e.db.run(self.e.set_setting, field, text.strip())
                 result = (
                     await self.e.db.run(self.queue_settings, user)

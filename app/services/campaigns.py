@@ -71,6 +71,7 @@ class Campaigns:
             "name",
             "dm_greeting_phrase",
             "dm_sticker_emoji",
+            "auto_subscribe",
         }
         for key, value in options.items():
             if key not in allowed:
@@ -157,6 +158,17 @@ class Campaigns:
                 )
                 self._cancel_group_replies(c, campaign_id=campaign_id)
             if status == "REMOVED":
+                for exchange in rows(
+                    c,
+                    "SELECT x.id FROM rotation_exchanges x JOIN rotation_cycles r ON r.id=x.cycle_id "
+                    "WHERE r.campaign_id=? AND x.status IN ('PREPARING','READY','DRAINING')",
+                    (campaign_id,),
+                ):
+                    self._end_exchange(c, exchange["id"], "CANCELLED", "CAMPAIGN_REMOVED")
+                c.execute(
+                    "UPDATE rotation_cycles SET status='CANCELLED',completed_at=? WHERE campaign_id=? AND status='PREPARING'",
+                    (self.clock(), campaign_id),
+                )
                 c.execute(
                     "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE campaign_id=? AND status IN ('ACTIVE','FAILED')",
                     (campaign_id,),

@@ -1,6 +1,6 @@
 from app.security import mask_phone
 
-from .core import DomainError, row, rows
+from .core import DomainError, dump, row, rows
 
 
 class Accounts:
@@ -126,6 +126,7 @@ class Accounts:
                     )
                     if action == "remove":
                         c.execute("DELETE FROM account_sessions WHERE account_id=?", (account_id,))
+                        c.execute("DELETE FROM account_entity_cache WHERE account_id=?", (account_id,))
                         c.execute(
                             "UPDATE accounts SET membership_status='REMOVED',telegram_id=NULL WHERE id=?", (account_id,)
                         )
@@ -200,6 +201,28 @@ class Accounts:
                 (failures, self.clock() + delay, account_id),
             )
             self.audit(c, "CONNECTION_RETRY", account_id=account_id, retry=failures, delay=delay)
+
+    def remember_entity(self, account_id, peer_id, data):
+        encoded = dump(data)
+        existing = self.db.one(
+            "SELECT encrypted_entity FROM account_entity_cache WHERE account_id=? AND peer_id=?", (account_id, peer_id)
+        )
+        if existing and self.secrets.decrypt(existing["encrypted_entity"]) == encoded:
+            return
+        with self.db.tx() as c:
+            account = row(c, "SELECT account_health FROM accounts WHERE id=?", (account_id,))
+            if not account or account["account_health"] == "REMOVED":
+                return
+            c.execute(
+                "INSERT INTO account_entity_cache VALUES (?,?,?,?) ON CONFLICT(account_id,peer_id) "
+                "DO UPDATE SET encrypted_entity=excluded.encrypted_entity,updated_at=excluded.updated_at",
+                (account_id, peer_id, self.secrets.encrypt(encoded), self.clock()),
+            )
+            c.execute(
+                "DELETE FROM account_entity_cache WHERE account_id=? AND peer_id NOT IN "
+                "(SELECT peer_id FROM account_entity_cache WHERE account_id=? ORDER BY updated_at DESC,rowid DESC LIMIT ?)",
+                (account_id, account_id, self.config.entity_cache_limit),
+            )
 
     def connection_succeeded(self, account_id):
         # A connection only resets network backoff; it cannot clear moderation restrictions or pauses.

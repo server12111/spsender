@@ -1,17 +1,21 @@
 """Real Telegram operations. Constructed only in explicitly configured live mode."""
 
 import asyncio
+import base64
 import hashlib
+import json
 import logging
 import random
 import re
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlparse
 from weakref import WeakValueDictionary
 
 from telethon import TelegramClient, errors, events, functions, types, utils
 
 from app.services.chat_pool import parse_target
+from app.services.memberships import CHALLENGE, membership_links, membership_prompt
 
 from .base import OperationError, Result
 from .session import BoundedStringSession
@@ -241,13 +245,51 @@ class TelegramTransport:
                 or current["flood_until"] > self.engine.clock()
             ):
                 return
-            gate = MANUAL_VERIFICATION.search(event.raw_text or "")
-            if not event.is_private and not event.is_reply and not gate:
+            gate = MANUAL_VERIFICATION.search(event.raw_text or "") or CHALLENGE.search(event.raw_text or "")
+            links, verify = membership_links(
+                event.raw_text or "", getattr(getattr(event, "message", None), "reply_markup", None)
+            )
+            membership = membership_prompt(
+                event.raw_text or "", getattr(getattr(event, "message", None), "reply_markup", None)
+            )
+            if not event.is_private and not event.is_reply and not gate and not membership:
                 return
             sender = await asyncio.wait_for(event.get_sender(), 30)
             if not sender:
                 return
+            await self._remember_peer(account_id, sender)
+            if getattr(sender, "bot", False) and membership:
+                parent = await self.engine.db.run(
+                    self.engine.membership_context, account_id, event.chat_id, private=event.is_private
+                )
+                trusted = bool(parent and event.is_private)
+                if parent and not event.is_private:
+                    target = await self.engine.db.run(
+                        self.engine.db.one, "SELECT link FROM chat_pool WHERE id=?", (parent,)
+                    )
+                    source = await self._peer_entity(event.client, account_id, event.chat_id, target["link"])
+                    permissions = await asyncio.wait_for(event.client.get_permissions(source, sender), 30)
+                    trusted = bool(permissions and (permissions.is_admin or permissions.is_creator))
+                if (
+                    trusted
+                    and links
+                    and await self.engine.db.run(
+                        self.engine.register_membership_request,
+                        account_id,
+                        parent,
+                        event.chat_id,
+                        event.id,
+                        sender.id,
+                        links,
+                        verify,
+                    )
+                ):
+                    return
+                if trusted:
+                    await self.engine.db.run(self.engine.membership_manual_required, account_id, parent, event.id)
+                    return
             if not event.is_private and getattr(sender, "bot", False) and gate:
+                await self.engine.db.run(self.engine.preparation_manual_required, account_id, event.chat_id)
                 await self.engine.db.run(self.engine.require_manual_verification, account_id, event.chat_id)
                 return
             reply_sender = None
@@ -357,40 +399,50 @@ class TelegramTransport:
             if not me:
                 raise OperationError("critical", "SESSION_EXPIRED")
             return Result(data={"authorized": True})
+        if job["kind"] == "MEMBERSHIP":
+            return await self._execute_membership(client, job)
         peer = payload["peer_id"]
-        if job["kind"] == "JOIN":
+        if job["kind"] in {"JOIN", "ROTATION_JOIN", "ROTATION_CHECK"}:
             # No contact manipulation or fabricated conversations are needed for preparation.
             link = payload.get("link", "")
-            if payload["join_allowed"]:
+            if payload["join_allowed"] and job["kind"] != "ROTATION_CHECK":
                 try:
                     if "t.me/+" in link:
                         await self.guard(job)
                         job["_request_may_have_been_sent"] = True
                         update = await client(functions.messages.ImportChatInviteRequest(link.rsplit("+", 1)[1]))
-                        entity = update.chats[0] if getattr(update, "chats", None) else await client.get_entity(peer)
+                        entity = (
+                            update.chats[0]
+                            if getattr(update, "chats", None)
+                            else await self._peer_entity(client, job["account_id"], peer, link)
+                        )
                     else:
-                        entity = await client.get_entity(link if link.startswith("@") else peer)
+                        entity = await self._peer_entity(client, job["account_id"], peer, link)
                         if isinstance(entity, types.Channel):
                             await self.guard(job)
                             job["_request_may_have_been_sent"] = True
                             await client(functions.channels.JoinChannelRequest(entity))
                 except errors.UserAlreadyParticipantError:
-                    entity = await client.get_entity(peer)
+                    entity = await self._peer_entity(client, job["account_id"], peer, link)
             else:
-                entity = await client.get_entity(peer)
+                entity = await self._peer_entity(client, job["account_id"], peer, link)
+            await self._remember_peer(job["account_id"], entity)
             permissions = await client.get_permissions(entity, "me")
-            if not can_publish(entity, permissions):
+            allowed = can_publish(entity, permissions)
+            if not allowed and job["kind"] == "JOIN":
                 raise OperationError("forbidden", "PUBLICATION_FORBIDDEN")
-            return Result(data={"joined": True, "can_write": True})
+            return Result(data={"joined": True, "can_write": allowed})
         if job["chat_pool_id"]:
             chat = await self.engine.db.run(
                 self.engine.db.one, "SELECT * FROM chat_pool WHERE id=?", (job["chat_pool_id"],)
             )
-            entity = await client.get_entity(chat["link"] if chat["link"].startswith("@") else peer)
+            entity = await self._peer_entity(client, job["account_id"], peer, chat["link"])
             permissions = await client.get_permissions(entity, "me")
             if not can_publish(entity, permissions, payload.get("media_kind") if payload.get("media_path") else None):
                 raise OperationError("forbidden", "PUBLICATION_FORBIDDEN")
             peer = entity
+        elif isinstance(peer, int):
+            peer = await self._peer_entity(client, job["account_id"], peer)
         reply_to = payload.get("reply_to") or payload.get("topic_id") or None
         await self.guard(job)
         media = payload.get("media_path")
@@ -439,6 +491,133 @@ class TelegramTransport:
             )
         return Result(message.id, {"api_accepted": True})
 
+    async def _execute_membership(self, client, job):
+        payload = job["payload"]
+        if payload["action"] == "CHECK":
+            entity = await self._peer_entity(client, job["account_id"], payload["peer_id"], payload["link"])
+            permissions = await client.get_permissions(entity, "me")
+            if not can_publish(entity, permissions):
+                raise OperationError("manual", "PUBLICATION_FORBIDDEN")
+            return Result(data={"can_write": True, "joined": True})
+        if payload["action"] == "VERIFY":
+            source = await self._peer_entity(client, job["account_id"], payload["peer_id"])
+            await self.guard(job)
+            job["_request_may_have_been_sent"] = True
+            try:
+                await client(
+                    functions.messages.GetBotCallbackAnswerRequest(
+                        peer=source, msg_id=payload["message_id"], data=base64.b64decode(payload["data"])
+                    )
+                )
+            except Exception as exc:
+                if type(exc).__name__ in {"DataInvalidError", "MessageIdInvalidError", "BotResponseTimeoutError"}:
+                    raise OperationError("manual", "MEMBERSHIP_CHECK_REQUIRED") from None
+                raise
+            return Result(data={"verified": True})
+        path = urlparse(payload["link"]).path.strip("/")
+        if path.startswith("+"):
+            await self.guard(job)
+            try:
+                job["_request_may_have_been_sent"] = True
+                update = await client(functions.messages.ImportChatInviteRequest(path[1:]))
+                entity = update.chats[0]
+            except errors.UserAlreadyParticipantError:
+                invite = await client(functions.messages.CheckChatInviteRequest(path[1:]))
+                entity = getattr(invite, "chat", None)
+                if entity is None:
+                    raise OperationError("manual", "MEMBERSHIP_CHECK_REQUIRED") from None
+        else:
+            entity = await client.get_entity("@" + path)
+            await self._remember_peer(job["account_id"], entity)
+            await self.guard(job)
+            if isinstance(entity, types.User) and entity.bot:
+                if payload.get("membership_request_id"):
+                    await self.engine.db.run(
+                        self.engine.membership_bot_resolved, job["id"], job["account_id"], entity.id
+                    )
+                await client(functions.messages.SetTypingRequest(entity, types.SendMessageTypingAction()))
+                await self.guard(job)
+                job["_request_may_have_been_sent"] = True
+                await client(
+                    functions.messages.StartBotRequest(entity, entity, payload["start_param"], payload["random_id"])
+                )
+                return Result(data={"peer_id": entity.id, "bot_started": True})
+            if not isinstance(entity, types.Channel):
+                raise OperationError("manual", "UNSUPPORTED_MEMBERSHIP_TARGET")
+            job["_request_may_have_been_sent"] = True
+            try:
+                await client(functions.channels.JoinChannelRequest(entity))
+            except errors.UserAlreadyParticipantError:
+                pass
+        permissions = await client.get_permissions(entity, "me")
+        if permissions is None or getattr(permissions, "has_left", False):
+            raise OperationError("manual", "MEMBERSHIP_CHECK_REQUIRED")
+        return Result(data={"peer_id": utils.get_peer_id(entity), "joined": True})
+
+    async def _remember_peer(self, account_id, entity):
+        if isinstance(entity, types.Channel) and entity.access_hash is not None:
+            await self.engine.db.run(
+                self.engine.remember_entity,
+                account_id,
+                utils.get_peer_id(entity),
+                {"kind": "channel", "id": entity.id, "access_hash": entity.access_hash},
+            )
+        elif isinstance(entity, types.Chat):
+            await self.engine.db.run(
+                self.engine.remember_entity, account_id, utils.get_peer_id(entity), {"kind": "chat", "id": entity.id}
+            )
+        elif isinstance(entity, types.User) and entity.access_hash is not None:
+            await self.engine.db.run(
+                self.engine.remember_entity,
+                account_id,
+                utils.get_peer_id(entity),
+                {"kind": "user", "id": entity.id, "access_hash": entity.access_hash},
+            )
+
+    async def _peer_entity(self, client, account_id, peer, link=""):
+        public_link = link if link.startswith("@") else ""
+        if not public_link and link:
+            try:
+                _, _, normalized = parse_target(link)
+                public_link = normalized if normalized.startswith("@") else ""
+            except ValueError:
+                pass
+        reference = public_link or peer
+        if not public_link:
+            saved = await self.engine.db.run(
+                self.engine.db.one,
+                "SELECT encrypted_entity FROM account_entity_cache WHERE account_id=? AND peer_id=?",
+                (account_id, peer),
+            )
+            if saved:
+                cached = json.loads(self.engine.secrets.decrypt(saved["encrypted_entity"]))
+                if cached["kind"] == "channel":
+                    reference = types.InputPeerChannel(cached["id"], cached["access_hash"])
+                elif cached["kind"] == "user":
+                    reference = types.InputPeerUser(cached["id"], cached["access_hash"])
+                else:
+                    reference = types.InputPeerChat(cached["id"])
+        try:
+            entity = await client.get_entity(reference)
+        except ValueError:
+            entity = None
+            if "t.me/+" in link:
+                invite = await client(functions.messages.CheckChatInviteRequest(link.rsplit("+", 1)[1]))
+                entity = getattr(invite, "chat", None)
+            if entity is None and hasattr(client, "iter_dialogs"):
+                async for dialog in client.iter_dialogs(limit=self.engine.config.entity_cache_limit):
+                    if utils.get_peer_id(dialog.entity) == peer:
+                        entity = dialog.entity
+                        break
+            if entity is None:
+                raise OperationError("manual", "PEER_REFERENCE_REQUIRED") from None
+        if isinstance(entity, (types.Channel, types.Chat, types.User)) and utils.get_peer_id(entity) != peer:
+            # A public username can be reassigned after import. Never join or
+            # publish to the new owner under an old approved chat assignment.
+            raise OperationError("manual", "PEER_REFERENCE_REQUIRED")
+        await self._remember_peer(account_id, entity)
+        return entity
+
     async def guard(self, job):
         if not await self.engine.db.run(self.engine.execution_allowed, job):
             raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
@@ -468,6 +647,7 @@ class TelegramTransport:
             entity = await asyncio.wait_for(client.get_entity(link), 30)
         if not isinstance(entity, (types.Chat, types.Channel)):
             raise ValueError("В пул разрешено добавлять только группы / каналы")
+        await self._remember_peer(account["id"], entity)
         return utils.get_peer_id(entity), topic, link, entity.title
 
     async def _disconnect_client(self, account_id, client, timeout=5):

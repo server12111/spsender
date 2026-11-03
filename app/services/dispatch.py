@@ -53,7 +53,15 @@ class Dispatch:
                 campaign["version"],
                 planned_at or self.clock(),
                 self.clock(),
-                {"CHECK": 0, "JOIN": 1, "GREETING": 2}.get(kind, 3),
+                {
+                    "CHECK": 0,
+                    "JOIN": 1,
+                    "GREETING": 2,
+                    "MEMBERSHIP": 1,
+                    "ROTATION_JOIN": 1,
+                    "ROTATION_CHECK": 1,
+                    "ROTATION_MESSAGE": 2,
+                }.get(kind, 3),
             ),
         ).lastrowid
         return job_id
@@ -145,6 +153,8 @@ class Dispatch:
             ):
                 self._stage(c, account, "PREPARING")
             self._fill_waiting(c)
+            for rotating in rows(c, "SELECT * FROM campaigns WHERE rotation_enabled=1 AND status='RUNNING'"):
+                self._plan_rotations(c, rotating)
             cursor = row(c, "SELECT value FROM settings WHERE key='planner_cursor'")
             cursor = int(cursor["value"]) if cursor else 0
             selected = rows(
@@ -169,12 +179,14 @@ class Dispatch:
                     continue
                 pending_before = row(c, "SELECT value FROM queue_counters WHERE name='pending'")["value"]
                 campaign = self.campaign(c, pair["campaign_id"])
+                self._plan_memberships(c, pair, campaign)
                 self._onboard(c, pair, campaign)
                 pair = self._pair(c, pair["id"])
                 self._sync_pair(c, pair)
                 pair = self._pair(c, pair["id"])
                 self._plan_dm_sequences(c, pair, campaign)
                 self._plan_group_replies(c, pair, campaign)
+                self._plan_rotation_pair(c, pair, campaign)
                 self._plan_dispatch(c, pair, campaign)
                 c.execute(
                     "INSERT INTO settings VALUES ('planner_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -191,6 +203,8 @@ class Dispatch:
 
     def _job_allowed(self, c, job, account, pair, campaign):
         if campaign["status"] != "RUNNING" or campaign["version"] != job["version"]:
+            return False
+        if self._rotation_pair_blocked(c, pair["id"]):
             return False
         payload = json.loads(job["payload"]) if isinstance(job["payload"], str) else job["payload"]
         if "dm_sequence_id" in payload:
@@ -222,6 +236,10 @@ class Dispatch:
         age = self.clock() - account["onboarding_started_at"]
         if age < 86400:
             return False
+        if job["kind"] == "MEMBERSHIP":
+            return self._membership_job_allowed(c, {**job, "payload": payload}, account, pair)
+        if job["kind"] in {"ROTATION_JOIN", "ROTATION_CHECK", "ROTATION_MESSAGE"}:
+            return self._rotation_job_allowed(c, {**job, "payload": payload}, account, pair, campaign)
         if job["kind"] == "CHECK":
             return True
         if job["kind"] == "JOIN":
@@ -307,8 +325,10 @@ class Dispatch:
                     c,
                     "SELECT j.* FROM dispatch_jobs j INDEXED BY job_ready_order JOIN campaigns ca ON ca.id=j.campaign_id JOIN pairs p ON p.id=j.pair_id WHERE j.status='PENDING' AND j.planned_at<=? "
                     "AND ca.status='RUNNING' AND (j.account_id IS NULL OR EXISTS(SELECT 1 FROM accounts own WHERE own.id=j.account_id AND own.account_health='OK' AND own.paused=0 AND own.flood_until<=?)) "
-                    "AND (j.kind IN ('CHECK','JOIN','GREETING') OR (EXISTS(SELECT 1 FROM accounts a WHERE a.id=p.account_a_id AND a.onboarding_stage='READY' AND a.account_health='OK' AND a.paused=0 AND a.flood_until<=?) AND EXISTS(SELECT 1 FROM accounts b WHERE b.id=p.account_b_id AND b.onboarding_stage='READY' AND b.account_health='OK' AND b.paused=0 AND b.flood_until<=?))) "
-                    "AND NOT EXISTS(SELECT 1 FROM dispatch_jobs busy WHERE busy.pair_id=j.pair_id AND busy.status IN ('INFLIGHT','UNKNOWN')) ORDER BY j.queue_rank,j.dispatch_order,j.id LIMIT 1",
+                    "AND (j.kind IN ('CHECK','JOIN','GREETING','MEMBERSHIP') OR (EXISTS(SELECT 1 FROM accounts a WHERE a.id=p.account_a_id AND a.onboarding_stage='READY' AND a.account_health='OK' AND a.paused=0 AND a.flood_until<=?) AND EXISTS(SELECT 1 FROM accounts b WHERE b.id=p.account_b_id AND b.onboarding_stage='READY' AND b.account_health='OK' AND b.paused=0 AND b.flood_until<=?))) "
+                    "AND NOT EXISTS(SELECT 1 FROM dispatch_jobs busy WHERE busy.status IN ('INFLIGHT','UNKNOWN') "
+                    "AND (busy.pair_id=j.pair_id OR (j.chat_pool_id IS NOT NULL AND busy.chat_pool_id=j.chat_pool_id))) "
+                    "ORDER BY j.queue_rank,j.dispatch_order,j.id LIMIT 1",
                     (self.clock(), self.clock(), self.clock(), self.clock()),
                 )
                 if not job:
@@ -338,8 +358,8 @@ class Dispatch:
                 if row(
                     c,
                     "SELECT 1 FROM dispatch_jobs WHERE status IN ('INFLIGHT','UNKNOWN') AND "
-                    "(account_id=? OR (pair_id=? AND chat_pool_id=?))",
-                    (account_id, pair["id"], job["chat_pool_id"]),
+                    "(account_id=? OR chat_pool_id=?)",
+                    (account_id, job["chat_pool_id"]),
                 ):
                     c.execute("UPDATE dispatch_jobs SET dispatch_order=? WHERE id=?", (self.clock(), job["id"]))
                     continue
@@ -411,7 +431,11 @@ class Dispatch:
                 "INSERT OR IGNORE INTO message_results(job_id,attempt_id,api_message_id,confirmed_at,result) VALUES (?,?,?,?,?)",
                 (job["id"], job["attempt_id"], result.message_id, now, dump(result.data)),
             )
-            if job["kind"] == "CHECK":
+            if job["kind"] in {"ROTATION_JOIN", "ROTATION_CHECK", "ROTATION_MESSAGE"}:
+                self._finish_rotation_job(c, job, result)
+            elif job["kind"] == "MEMBERSHIP":
+                self._finish_membership(c, job, result)
+            elif job["kind"] == "CHECK":
                 c.execute(
                     "UPDATE accounts SET prepared_at=COALESCE(prepared_at,?) WHERE id=?", (now, job["account_id"])
                 )
@@ -484,7 +508,10 @@ class Dispatch:
             c.execute(
                 "UPDATE message_attempts SET outcome=?,error=? WHERE id=?", (status, error.code, job["attempt_id"])
             )
-            if error.category == "cancelled" and error.code == "CANCELLED_BEFORE_REQUEST":
+            preparation_error = job["kind"] in {"ROTATION_JOIN", "ROTATION_CHECK", "ROTATION_MESSAGE", "MEMBERSHIP"}
+            if preparation_error and error.category in {"manual", "chat", "forbidden", "recipient"}:
+                self._preparation_failed(c, job, error.code)
+            elif error.category == "cancelled" and error.code == "CANCELLED_BEFORE_REQUEST":
                 pair = self._pair(c, job["pair_id"])
                 campaign = row(c, "SELECT * FROM campaigns WHERE id=?", (job["campaign_id"],))
                 account = row(c, "SELECT * FROM accounts WHERE id=?", (job["account_id"],))
@@ -583,6 +610,8 @@ class Dispatch:
             terminal = row(c, "SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],))
             if terminal["status"] == "FAILED":
                 self._fail_dm_step(c, job, error.code)
+                if preparation_error and error.category not in {"manual", "chat", "forbidden", "recipient"}:
+                    self._preparation_failed(c, job, error.code)
             self.audit(
                 c,
                 "JOB_ERROR",

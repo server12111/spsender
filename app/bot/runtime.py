@@ -245,6 +245,41 @@ class BotNotificationSink:
                 f"⚠️ Рассылка №{payload['campaign_id']} приостановлена\nПричина: {label(payload['reason'])}\nИсправьте шаблон / медиа и возобновите рассылку.",
                 [[ui.button(admin_id, "📣 Рассылка", "card", {"id": payload["campaign_id"], "section": "campaigns"})]],
             )
+        elif kind == "rotation_summary":
+            view = View(
+                f"🔄 Еженедельный обмен завершён\nУспешных обменов: {payload['applied']}\n"
+                f"Пропущено из-за неготовности: {payload['skipped']}\nОтменено: {payload['cancelled']}\n"
+                "Состав аккаунтов, тексты и смены сохранены.",
+                [[ui.button(admin_id, "🔎 Обмены и подготовка", "rotation", {"id": payload["campaign_id"]})]],
+            )
+        elif kind == "rotation":
+            applied = payload["status"] == "APPLIED"
+            view = View(
+                f"🔄 {'Обмен чатов выполнен' if applied else 'Обмен чатов пропущен'}\n"
+                f"Пары №{payload['left']} ↔ №{payload['right']}\n"
+                + (
+                    "Аккаунты, тексты и смены сохранены."
+                    if applied
+                    else "Подготовка не завершена; текущие чаты сохранены."
+                ),
+                [[ui.button(admin_id, "🔎 Подготовка и обмен", "rotation", {"id": payload["campaign_id"]})]],
+            )
+        elif kind == "preparation_error":
+            view = View(
+                f"⚠️ Подготовка требует внимания\nАккаунт №{payload['account_id']} · {payload['title']}\n"
+                f"{payload['link']}\nПричина: {label(payload['reason'])}\nАвтоматического обхода проверок нет.",
+                [
+                    [
+                        ui.button(
+                            admin_id,
+                            "🔄 Обмен чатов",
+                            "rotation_detail" if payload.get("exchange_id") else "rotation",
+                            {"id": payload.get("exchange_id") or payload["campaign_id"]},
+                        ),
+                        ui.button(admin_id, "💬 Чат", "card", {"id": payload["chat_pool_id"], "section": "chats"}),
+                    ]
+                ],
+            )
         elif kind == "reply_failed":
             view = View(
                 f"⚠️ Ответ в ЛС не отправлен\nАккаунт №{payload['account_id']} · Собеседник {payload['peer_id']}\n"

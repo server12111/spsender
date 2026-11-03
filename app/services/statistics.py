@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-SEND_KINDS = "('MAILING','GREETING','GROUP_REPLY','DM_FIRST','DM_ALWAYS','DM_MANUAL')"
+SEND_KINDS = "('MAILING','GREETING','GROUP_REPLY','DM_FIRST','DM_ALWAYS','DM_MANUAL','ROTATION_MESSAGE')"
 
 
 def period_bounds(period, now, tz):
