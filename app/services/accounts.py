@@ -4,6 +4,20 @@ from .core import DomainError, dump, row, rows
 
 
 class Accounts:
+    def _account_operation_unresolved(self, c, account_id):
+        return bool(
+            row(
+                c,
+                "SELECT 1 FROM dispatch_jobs WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN') LIMIT 1",
+                (account_id,),
+            )
+            or row(
+                c,
+                "SELECT 1 FROM legacy_rpc_journal WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN') LIMIT 1",
+                (account_id,),
+            )
+        )
+
     def add_account(self, name, phone, session="", telegram_id=None, campaign_id=None):
         if not name.strip():
             raise DomainError("Укажите название аккаунта")
@@ -48,7 +62,7 @@ class Accounts:
         old = row(c, "SELECT * FROM campaign_members WHERE account_id=?", (account_id,))
         if old and old["campaign_id"] == campaign_id:
             return
-        if row(c, "SELECT * FROM dispatch_jobs WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN')", (account_id,)):
+        if self._account_operation_unresolved(c, account_id):
             raise DomainError("Дождитесь результата текущей операции / разрешите неопределённый результат")
         self._detach_account(c, account_id)
         c.execute("INSERT INTO campaign_members VALUES (?,?)", (account_id, campaign_id))
@@ -77,6 +91,10 @@ class Accounts:
         if pair:
             if row(
                 c, "SELECT 1 FROM dispatch_jobs WHERE pair_id=? AND status IN ('INFLIGHT','UNKNOWN')", (pair["id"],)
+            ) or any(
+                self._account_operation_unresolved(c, aid)
+                for aid in (pair["account_a_id"], pair["account_b_id"])
+                if aid
             ):
                 raise DomainError("Сначала дождитесь / сверьте текущую операцию пары")
             self._pause_clock(c, pair)
@@ -109,9 +127,7 @@ class Accounts:
                 raise DomainError("Аккаунт удалён")
             if action == "resume" and account["account_health"] != "OK":
                 raise DomainError("Сначала восстановите авторизацию или подтвердите снятие ограничения")
-            if action == "remove" and row(
-                c, "SELECT 1 FROM dispatch_jobs WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN')", (account_id,)
-            ):
+            if action == "remove" and self._account_operation_unresolved(c, account_id):
                 raise DomainError("Сначала дождитесь / сверьте результат текущей операции")
             if action == "rename":
                 if not str(value).strip():
@@ -120,9 +136,18 @@ class Accounts:
             elif action in {"pause", "resume", "disconnect", "remove"}:
                 c.execute("UPDATE accounts SET paused=? WHERE id=?", (action != "resume", account_id))
                 if action in {"disconnect", "remove"}:
+                    next_health = (
+                        "REMOVED"
+                        if action == "remove"
+                        else (
+                            account["account_health"]
+                            if account["account_health"] in {"FROZEN", "RESTRICTED"}
+                            else "DISCONNECTED"
+                        )
+                    )
                     c.execute(
                         "UPDATE accounts SET account_health=? WHERE id=?",
-                        ("REMOVED" if action == "remove" else "DISCONNECTED", account_id),
+                        (next_health, account_id),
                     )
                     if action == "remove":
                         c.execute("DELETE FROM account_sessions WHERE account_id=?", (account_id,))
@@ -156,9 +181,7 @@ class Accounts:
                 raise DomainError("Аккаунт удалён")
             if account["telegram_id"] is not None and account["telegram_id"] != telegram_id:
                 raise DomainError("Этот номер принадлежит другому Telegram аккаунту. Добавьте его отдельно")
-            if row(
-                c, "SELECT 1 FROM dispatch_jobs WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN')", (account_id,)
-            ):
+            if self._account_operation_unresolved(c, account_id):
                 raise DomainError("Сначала дождитесь / сверьте текущую операцию аккаунта")
             c.execute(
                 "UPDATE account_sessions SET encrypted_session=?,updated_at=? WHERE account_id=?",

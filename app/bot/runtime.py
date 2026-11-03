@@ -250,6 +250,8 @@ class BotNotificationSink:
                     ],
                 ],
             )
+            if payload.get("account_health", payload["health"]) != payload["health"]:
+                view.text += "\nСохраняется ограничение: " + label(payload["account_health"])
         elif kind == "manual":
             view = View(
                 f"🛑 Нужна ручная проверка\n{payload['title']}\n{payload['link']}\nАккаунт №{payload['account_id']}\nАвтоматическое прохождение не выполняется.",

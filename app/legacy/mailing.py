@@ -1,18 +1,41 @@
 """Bind the original mailing loop and delivery code to pair shifts and receipts."""
 
+import asyncio
+from contextlib import nullcontext
 from contextvars import ContextVar
 
 from app.services.pairs import shift_role
 from app.transport.base import OperationError
 
 from .mailing_database import LegacyMailingDatabase
-from .original_mailing import MailingService
+from .original_mailing import _FROZEN_ACCOUNT_MARKER, MailingService
 
 mailing_context = ContextVar("legacy_mailing_pair", default=None)
 target_context = ContextVar("legacy_mailing_target", default=None)
 
 
 class PairedMailingService(MailingService):
+    async def _handle_mailing_ban(self, mailing_id, account_id, error):
+        from app.transport.telegram import classify_error
+
+        classified = classify_error(error)
+        health = (
+            classified.code
+            if classified.category == "critical"
+            else "FROZEN"
+            if _FROZEN_ACCOUNT_MARKER in str(error).lower()
+            else "SESSION_EXPIRED"
+        )
+        # A virtual mailing is one pair, while its campaign can contain many
+        # healthy pairs. Moderation pauses the affected account/pair only.
+        await self.runtime.engine.db.run(self.runtime.engine.critical, account_id, health)
+        task = self._tasks.pop(mailing_id, None)
+        if task and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        for mapping in (self._stagger_until, self._working_targets, self._message_rotation):
+            mapping.pop(mailing_id, None)
+
     def __init__(self, runtime):
         self.runtime = runtime
         super().__init__(LegacyMailingDatabase(runtime.engine), runtime)
@@ -42,6 +65,8 @@ class PairedMailingService(MailingService):
         from app.transport.telegram import classify_error
 
         classified = classify_error(error)
+        if classified.category == "cancelled":
+            return
         target = await self.runtime.engine.db.run(
             self.runtime.engine.db.one, "SELECT chat_pool_id FROM pair_chats WHERE id=?", (target_obj.id,)
         )
@@ -123,10 +148,10 @@ class PairedMailingService(MailingService):
     async def guard(self, account_id):
         return await self.runtime.engine.db.run(self._guard, account_id)
 
-    def _guard(self, account_id):
+    def _guard(self, account_id, connection=None):
         engine = self.runtime.engine
         pair_id = mailing_context.get()
-        with engine.db.read() as connection:
+        with nullcontext(connection) if connection is not None else engine.db.read() as connection:
             pair = engine._pair(connection, pair_id)
             campaign = engine.campaign(connection, pair["campaign_id"])
             active = (
@@ -139,7 +164,7 @@ class PairedMailingService(MailingService):
             target = target_context.get()
             if target:
                 current = connection.execute(
-                    "SELECT pc.*,cp.approved FROM pair_chats pc JOIN chat_pool cp ON cp.id=pc.chat_pool_id WHERE pc.id=? AND pc.removed_at IS NULL",
+                    "SELECT pc.*,cp.approved,cp.greeting_allowed FROM pair_chats pc JOIN chat_pool cp ON cp.id=pc.chat_pool_id WHERE pc.id=? AND pc.removed_at IS NULL",
                     (target["id"],),
                 ).fetchone()
                 if (
@@ -149,6 +174,13 @@ class PairedMailingService(MailingService):
                     or campaign["version"] != target["version"]
                 ):
                     raise OperationError("cancelled", "ASSIGNMENT_CHANGED")
+                if engine._greeting_pending(connection, campaign, current):
+                    raise OperationError("cancelled", "GREETING_PENDING")
+                if connection.execute(
+                    "SELECT 1 FROM chat_failures WHERE pair_id=? AND chat_pool_id=? AND account_id=?",
+                    (pair_id, target["chat_pool_id"], account_id),
+                ).fetchone():
+                    raise OperationError("cancelled", "CHAT_REQUIRES_REVIEW")
                 access = connection.execute(
                     "SELECT manual_required FROM account_chat_access WHERE account_id=? AND chat_pool_id=?",
                     (account_id, target["chat_pool_id"]),

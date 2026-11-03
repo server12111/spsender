@@ -20,12 +20,18 @@ class Notifications:
         if health not in {"FROZEN", "SESSION_EXPIRED", "RESTRICTED", "DISCONNECTED"}:
             raise ValueError("Invalid critical health")
         account = row(c, "SELECT * FROM accounts WHERE id=?", (account_id,))
-        if not account:
+        if not account or account["account_health"] == "REMOVED":
             return
+        reported_health = health
+        if account["account_health"] in {"FROZEN", "RESTRICTED"} and health in {"SESSION_EXPIRED", "DISCONNECTED"}:
+            # A later auth/network failure cannot implicitly acknowledge that
+            # an outstanding moderation restriction has been removed.
+            health = account["account_health"]
         if account["account_health"] == health:
             if not account["paused"]:
                 c.execute("UPDATE accounts SET paused=1 WHERE id=?", (account_id,))
-            return
+            if reported_health == health or account["last_error"] == reason:
+                return
         c.execute("UPDATE accounts SET account_health=?,paused=1,last_error=? WHERE id=?", (health, reason, account_id))
         c.execute("UPDATE dispatch_jobs SET status='CANCELLED' WHERE account_id=? AND status='PENDING'", (account_id,))
         pair = row(c, "SELECT * FROM pairs WHERE account_a_id=? OR account_b_id=?", (account_id, account_id))
@@ -42,7 +48,8 @@ class Notifications:
             "ACCOUNT_CRITICAL",
             account_id=account_id,
             pair_id=pair["id"] if pair else None,
-            health=health,
+            health=reported_health,
+            account_health=health,
             reason=reason,
         )
         event_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -53,7 +60,8 @@ class Notifications:
             {
                 "account_id": account_id,
                 "name": account["name"],
-                "health": health,
+                "health": reported_health,
+                "account_health": health,
                 "reason": reason,
                 "pair_id": pair["id"] if pair else None,
                 "campaign_id": pair["campaign_id"] if pair else None,

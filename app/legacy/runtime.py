@@ -293,6 +293,16 @@ class LegacyRuntime:
         self._me_ids[account_id] = telegram_id
         return wrapped
 
+    async def stop_client(self, account_id):
+        lock = self.transport._operation_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            client = getattr(self.transport, "clients", {}).get(account_id)
+            if client is not None:
+                await self.transport._disconnect_client(account_id, client)
+            wrapped = self._clients.get(account_id)
+            if wrapped and (client is None or wrapped.client is client):
+                self._clients.pop(account_id, None)
+
     async def guard(self, account_id, operation_id=None):
         busy = await self.engine.db.run(
             self.engine.db.one,
@@ -353,6 +363,14 @@ class LegacyRuntime:
                 return None, old["result"]
             if old and old["status"] in {"INFLIGHT", "UNKNOWN"}:
                 raise OperationError("cancelled", "LEGACY_RESULT_UNRESOLVED")
+            if target and name in DELIVERY_METHODS:
+                # Close the window between the async guards and this write:
+                # UI stop and ordinary queue claims use the same writer lock.
+                self.mailing._guard(account_id, connection)
+                if connection.execute(
+                    "SELECT 1 FROM dispatch_jobs WHERE account_id=? AND status='INFLIGHT' LIMIT 1", (account_id,)
+                ).fetchone():
+                    raise OperationError("cancelled", "ACCOUNT_BUSY")
             now = self.engine.clock()
             if target and name in DELIVERY_METHODS:
                 connection.execute(

@@ -82,6 +82,10 @@ class Core:
             raise PermissionError("Доступ закрыт")
 
     def audit(self, c, event, campaign_id=None, pair_id=None, account_id=None, chat_pool_id=None, **detail):
+        if campaign_id is None and pair_id is not None:
+            pair = row(c, "SELECT campaign_id FROM pairs WHERE id=?", (pair_id,))
+            if pair:
+                campaign_id = pair["campaign_id"]
         c.execute(
             "INSERT INTO audit_events(event,campaign_id,pair_id,account_id,chat_pool_id,detail,created_at) "
             "VALUES (?,?,?,?,?,?,?)",

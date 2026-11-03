@@ -1,0 +1,25 @@
+{
+  "accounts": 1000,
+  "chats": 10000,
+  "processing": {
+    "confirmed": 1000,
+    "duplicates": 0,
+    "max_concurrency": 3,
+    "restart_performed": true,
+    "wall_seconds": 55.3158,
+    "cpu_seconds": 58.7031,
+    "event_loop_lag_max_ms": 58.954,
+    "warmup_candidate_checks": 100000,
+    "warmup_candidate_seconds": 0.0603
+  },
+  "sqlite_integrity": "ok",
+  "sqlite_fk_errors": 0,
+  "confirmed_results": 1000,
+  "memory": {
+    "rss_mb": 76.18,
+    "process_peak_rss_mb": 78.33
+  },
+  "real_telegram_operations": 0,
+  "pipeline": "original MailingService delivery with guarded native-client doubles",
+  "app_version": "2.2.2"
+}

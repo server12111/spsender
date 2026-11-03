@@ -102,11 +102,27 @@ class LegacyMailingDatabase(LegacyDatabase):
     def get_mailing_targets(self, mailing_id):
         with self.engine.db.read() as connection:
             pair = self.engine._pair(connection, mailing_id)
+            campaign = self.engine.campaign(connection, pair["campaign_id"])
+            account_id = (
+                pair["account_a_id"]
+                if shift_role(self.engine.clock(), campaign["timezone"]) == "A"
+                else pair["account_b_id"]
+            )
+            failures = {
+                item[0]
+                for item in connection.execute(
+                    "SELECT chat_pool_id FROM chat_failures WHERE pair_id=? AND account_id=?", (mailing_id, account_id)
+                ).fetchall()
+            }
             chats = self.engine._assigned_chats(connection, mailing_id)
             total = active_count(len(chats), self.engine.elapsed(pair))
             result = []
             for chat in chats[:total]:
                 if chat["status"] != "ASSIGNED" or not chat["approved"]:
+                    continue
+                if chat["chat_pool_id"] in failures:
+                    continue
+                if self.engine._greeting_pending(connection, campaign, chat):
                     continue
                 access = connection.execute(
                     "SELECT count(*) FROM account_chat_access WHERE account_id IN (?,?) AND chat_pool_id=? AND joined=1 AND can_write=1 AND manual_required=0",
@@ -222,12 +238,35 @@ class LegacyMailingDatabase(LegacyDatabase):
         )
 
     async def deactivate_account(self, account_id):
-        await self.engine.db.run(self.engine.critical, account_id, "SESSION_EXPIRED")
+        def write():
+            with self.engine.db.tx() as connection:
+                account = connection.execute("SELECT account_health FROM accounts WHERE id=?", (account_id,)).fetchone()
+                if not account or account[0] in {"FROZEN", "RESTRICTED", "REMOVED"}:
+                    return False
+                self.engine._critical(connection, account_id, "SESSION_EXPIRED", "SESSION_EXPIRED")
+                return True
+
+        return await self.engine.db.run(write)
 
     async def delete_mailing_target(self, target_id):
-        target = await self.engine.db.run(self.engine.db.one, "SELECT * FROM pair_chats WHERE id=?", (target_id,))
-        if target:
-            # Preserve the 2.0 review/automatic-replacement workflow.
-            await self.engine.db.run(
-                self.engine.chat_failure, target["pair_id"], target["chat_pool_id"], None, "CHAT_UNAVAILABLE", True
-            )
+        def write():
+            with self.engine.db.tx() as connection:
+                target = connection.execute(
+                    "SELECT pc.*,p.account_a_id,p.account_b_id,c.timezone FROM pair_chats pc JOIN pairs p ON p.id=pc.pair_id "
+                    "JOIN campaigns c ON c.id=p.campaign_id WHERE pc.id=? AND pc.removed_at IS NULL",
+                    (target_id,),
+                ).fetchone()
+                if not target:
+                    return
+                account_id = (
+                    target["account_a_id"]
+                    if shift_role(self.engine.clock(), target["timezone"]) == "A"
+                    else target["account_b_id"]
+                )
+                account_id = account_id or target["account_a_id"] or target["account_b_id"]
+                if account_id:
+                    self.engine._chat_failure(
+                        connection, target["pair_id"], target["chat_pool_id"], account_id, "CHAT_UNAVAILABLE", True
+                    )
+
+        await self.engine.db.run(write)

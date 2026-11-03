@@ -12,6 +12,18 @@ def greeting_pool():
 
 
 class Greetings:
+    def _greeting_pending(self, c, campaign, chat):
+        if not campaign["greeting_enabled"] or not chat["greeting_allowed"]:
+            return False
+        if not self.templates(campaign["id"], "greeting", campaign["version"], c):
+            return False
+        progress = row(
+            c,
+            "SELECT * FROM greeting_progress WHERE campaign_id=? AND chat_pool_id=?",
+            (campaign["id"], chat["chat_pool_id"]),
+        )
+        return not progress or not all(progress[key + "_done"] for key in ("emoji", "phrase", "main"))
+
     def _greeting(self, c, pair, campaign, chat):
         progress = row(
             c,
