@@ -558,7 +558,8 @@ class Interface:
                 text += f"Пара №{assignment['pair_id']} · Назначен {self.time(assignment['assigned_at'])}\nПоследняя отправка: {self.time(assignment['last_sent_at'])}\nCooldown до {self.time(assignment['cooldown_until'])}\nПоследняя ошибка: {label(assignment['last_error'])}\n"
             text += metric
             access_rows = self.e.db.all(
-                "SELECT aca.*,a.name FROM account_chat_access aca JOIN accounts a ON a.id=aca.account_id WHERE aca.chat_pool_id=? ORDER BY a.id",
+                "SELECT aca.*,a.name FROM account_chat_access aca JOIN accounts a ON a.id=aca.account_id "
+                "WHERE aca.chat_pool_id=? AND a.account_health<>'REMOVED' ORDER BY a.id",
                 (item_id,),
             )
             text += "\n\nПрава аккаунтов:\n" + "\n".join(
@@ -1111,13 +1112,12 @@ class Interface:
                     form["texts"],
                     form["interval"],
                     form["limit"],
+                    accounts=list(form.get("accounts", [])),
                     **{
                         k: form.get(k, False)
                         for k in ("greeting_enabled", "group_reply_enabled", "dm_first_enabled", "dm_always_enabled")
                     },
                 )
-                for account_id in form["accounts"]:
-                    await self.e.db.run(self.e.assign_account, account_id, campaign_id)
                 await self.e.db.run(self.clear, user)
                 return await self.e.db.run(self.card, user, "campaigns", campaign_id)
             return await self.e.db.run(self.wizard, user, form)
@@ -1209,7 +1209,7 @@ class Interface:
             pair_id = await self.e.db.run(self.e.link_pair, data["a"], data["b"])
             return await self.e.db.run(self.card, user, "pairs", pair_id)
         if action == "pair_chats":
-            chats = await self.e.db.run(self.e.pair_card, item_id)["chats"]
+            chats = (await self.e.db.run(self.e.pair_card, item_id))["chats"]
             page = data.get("page", 0)
             buttons = [
                 [
@@ -1439,8 +1439,13 @@ class Interface:
             for key, title in flags.items()
         ]
         buttons.append([self.button(user, "✅ Импортировать", "import_confirm", once=True)])
+        skipped = form.get("skipped") or []
+        note = ""
+        if skipped:
+            note = f"\nПропущено нераспознанных строк: {len(skipped)}\n" + "\n".join("• " + s[:60] for s in skipped[:5])
         return View(
-            f"Импорт · Шаг 2 из 2\nСтрок: {len(form['lines'])}\nПодтвердите права и правила сообществ. Одно подтверждение применяется к этому списку.",
+            f"Импорт · Шаг 2 из 2\nСтрок: {len(form['lines'])}{note}\n"
+            "Подтвердите права и правила сообществ. Одно подтверждение применяется к этому списку.",
             buttons + self.cancel(user),
         )
 
@@ -1591,9 +1596,16 @@ class Interface:
                 raise DomainError("Импортируйте от 1 до 1000 строк за один раз")
             from app.services.chat_pool import parse_target
 
+            valid, skipped = [], []
             for line in lines:
-                parse_target(line)
-            return await self.e.db.run(self.import_confirmation, user, {"lines": lines})
+                try:
+                    parse_target(line)
+                    valid.append(line)
+                except DomainError:
+                    skipped.append(line)
+            if not valid:
+                raise DomainError("Ни одна строка не распознана. Нужен ID[:тема], @username или ссылка t.me")
+            return await self.e.db.run(self.import_confirmation, user, {"lines": valid, "skipped": skipped})
         if name == "manual_dm":
             await self.e.db.run(
                 self.e.manual_dm_reply,

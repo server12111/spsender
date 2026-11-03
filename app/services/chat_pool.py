@@ -8,14 +8,24 @@ def parse_target(value):
     if re.fullmatch(r"-?\d+(?::\d+)?", value):
         parts = value.split(":")
         return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0, value
-    match = re.fullmatch(r"(?:https?://)?t\.me/c/(\d+)/(\d+)(?:/\d+)?/?", value)
+    if re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,}", value):
+        return None, 0, "@" + value[1:].lower()
+    # Normalise a web link: drop the scheme, accept the telegram.me mirror and a www. prefix,
+    # then strip any ?query / #fragment (e.g. ?start=ref) and the trailing slash before matching.
+    url = re.sub(r"^https?://", "", value)
+    url = re.sub(r"^(?:www\.)?(?:telegram|t)\.me/", "t.me/", url, count=1)
+    url = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    match = re.fullmatch(r"t\.me/c/(\d+)/(\d+)(?:/\d+)?", url)
     if match:
         return int("-100" + match[1]), int(match[2]), value
-    match = re.fullmatch(r"(?:(?:https?://)?t\.me/|@)([A-Za-z][A-Za-z0-9_]{3,})(?:/(\d+))?/?", value)
+    # Private invites: the modern +hash form and the legacy joinchat/hash form carry the same hash.
+    match = re.fullmatch(r"t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)", url)
+    if match:
+        return None, 0, "https://t.me/+" + match[1]
+    # Public @username, optionally behind the /s/ web-preview prefix, with an optional message/topic id.
+    match = re.fullmatch(r"t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})(?:/(\d+))?", url)
     if match:
         return None, int(match[2] or 0), "@" + match[1].lower()
-    if re.fullmatch(r"(?:https?://)?t\.me/\+[A-Za-z0-9_-]+", value):
-        return None, 0, value if value.startswith("http") else "https://" + value
     raise DomainError("Укажите ID[:тема], @username или ссылку t.me")
 
 

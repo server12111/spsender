@@ -2,7 +2,7 @@ from .core import DomainError, rows
 
 
 class Campaigns:
-    def create_campaign(self, name, texts, interval=300, chat_limit=20, **options):
+    def create_campaign(self, name, texts, interval=300, chat_limit=20, accounts=(), **options):
         if not name.strip() or not texts or interval < 1 or chat_limit < 1:
             raise DomainError("Нужны название, текст, положительные интервал и N")
         with self.db.tx() as c:
@@ -18,6 +18,11 @@ class Campaigns:
             ).lastrowid
             self._write_templates(c, campaign_id, 1, "mailing", texts)
             self._campaign_options(c, campaign_id, options)
+            # Attach the chosen accounts inside the same transaction: if any of them cannot be
+            # assigned (e.g. removed between selection and save) the whole campaign rolls back
+            # instead of leaving a half-built mailing behind.
+            for account_id in accounts:
+                self._assign_account(c, account_id, campaign_id)
             self.audit(c, "CAMPAIGN_CREATED", campaign_id=campaign_id)
             return campaign_id
 

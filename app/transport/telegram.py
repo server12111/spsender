@@ -432,6 +432,10 @@ class TelegramTransport:
             entity = await client.get_entity(link)
         if not isinstance(entity, (types.Chat, types.Channel)):
             raise ValueError("В пул разрешено добавлять только группы / каналы")
+        # A number in a public link (t.me/<chat>/55) is a forum topic only in forums; in an ordinary
+        # group it is a message id, so keep it as a topic only when the resolved chat really is a forum.
+        if topic and not getattr(entity, "forum", False):
+            topic = 0
         return utils.get_peer_id(entity), topic, link, entity.title
 
     async def close(self):
