@@ -25,9 +25,23 @@ class Dispatch:
                 budget["remaining"] -= 1
         if existing:
             if existing["status"] == "CANCELLED":
+                # Rebind to the current campaign/pair/chat too: a key that is not scoped to them
+                # (e.g. CHECK's "prepare:<account>") would otherwise revive a job still pointing at
+                # the old campaign after the account is moved, and it never runs in the new one.
                 c.execute(
-                    "UPDATE dispatch_jobs SET status='PENDING',account_id=?,payload=?,version=?,planned_at=?,current_attempt_id=NULL,retry_count=0,lease_owner=NULL,lease_until=NULL,last_error=NULL WHERE id=?",
-                    (account_id, dump(payload), campaign["version"], planned_at or self.clock(), existing["id"]),
+                    "UPDATE dispatch_jobs SET status='PENDING',campaign_id=?,pair_id=?,chat_pool_id=?,account_id=?,"
+                    "payload=?,version=?,planned_at=?,current_attempt_id=NULL,retry_count=0,lease_owner=NULL,"
+                    "lease_until=NULL,last_error=NULL WHERE id=?",
+                    (
+                        campaign["id"],
+                        pair["id"],
+                        chat_id,
+                        account_id,
+                        dump(payload),
+                        campaign["version"],
+                        planned_at or self.clock(),
+                        existing["id"],
+                    ),
                 )
                 return existing["id"]
             return existing["id"] if existing["status"] == "PENDING" else None

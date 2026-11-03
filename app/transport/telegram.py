@@ -339,7 +339,12 @@ class TelegramTransport:
         if job["kind"] == "JOIN":
             # No contact manipulation or fabricated conversations are needed for preparation.
             link = payload.get("link", "")
-            if payload["join_allowed"]:
+            # Re-read the permission now: a join revoked after the job was queued must not be
+            # overridden by the value captured in the payload. Without it we only verify membership.
+            current = await self.engine.db.run(
+                self.engine.db.one, "SELECT join_allowed FROM chat_pool WHERE id=?", (job["chat_pool_id"],)
+            )
+            if current and current["join_allowed"]:
                 try:
                     if "t.me/+" in link:
                         await self.guard(job)

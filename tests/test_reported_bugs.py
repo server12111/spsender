@@ -93,3 +93,71 @@ async def test_failed_dm_chain_is_cancelled_and_unblocks_peer(env):
     del transport.errors[("DM_ALWAYS", active, None)]
     assert e.incoming(active, 700, 2, 700, True)
     assert e.db.scalar("SELECT count(*) FROM dm_reply_sequences WHERE status='ACTIVE'") == 1
+
+
+# 7. Moving an account between campaigns stranded its already-queued CHECK on the old pair.
+def test_reassigning_account_rebinds_its_pending_check(env):
+    e, clock, _, _ = env
+    ca, pair, a, _, _ = setup_pair(e, 1, ready=False)
+    clock.advance(86400)
+    e.tick()
+    before = e.db.one("SELECT campaign_id FROM dispatch_jobs WHERE idempotency_key=?", (f"prepare:{a}",))
+    assert before and before["campaign_id"] == ca  # CHECK queued against the first campaign
+
+    cb = e.create_campaign("Вторая", ["Текст"], chat_limit=1)
+    e.campaign_status(cb, "RUNNING", confirmed=True)
+    e.assign_account(a, cb)
+    pair_b = e.db.scalar("SELECT id FROM pairs WHERE campaign_id=? AND account_a_id=?", (cb, a))
+    e.tick()
+
+    job = e.db.one("SELECT campaign_id,pair_id,status FROM dispatch_jobs WHERE idempotency_key=?", (f"prepare:{a}",))
+    # After the move the revived CHECK must point at the new campaign/pair, or it never runs.
+    assert job["campaign_id"] == cb
+    assert job["pair_id"] == pair_b
+    assert job["status"] != "CANCELLED"
+
+
+# 8. A join revoked after the job was queued was ignored (stale payload permission was used).
+async def test_revoked_join_permission_stops_a_queued_join(env):
+    from types import SimpleNamespace
+
+    from telethon import types
+    from test_typing_and_spacing import adapter_for
+
+    e, _, _, _ = env
+
+    class JoinClient:
+        def __init__(self):
+            self.requests = []
+
+        async def __call__(self, request):
+            self.requests.append(type(request).__name__)
+            return SimpleNamespace(chats=[])
+
+        async def get_entity(self, peer):
+            return types.Channel(id=4242, title="Канал", photo=None, date=None, megagroup=True)
+
+        async def get_permissions(self, entity, who):
+            return SimpleNamespace(has_left=False, is_admin=True, is_creator=True, participant=None)
+
+    def join_job(chat_id):
+        return {
+            "kind": "JOIN",
+            "account_id": 1,
+            "chat_pool_id": chat_id,
+            "payload": {"peer_id": -100042, "link": "-100042", "join_allowed": True},  # stale allow
+        }
+
+    # Permission granted -> a real join request is issued.
+    chat = e.add_chat(-100042, "Канал", approved=True, join_allowed=True)
+    client = JoinClient()
+    result = await adapter_for(e, client, guard=False).execute(join_job(chat))
+    assert "JoinChannelRequest" in client.requests
+    assert result.data["joined"]
+
+    # Permission revoked after queueing -> no join, only membership is verified.
+    e.set_chat_permissions(chat, approved=True, join_allowed=False)
+    revoked_client = JoinClient()
+    result = await adapter_for(e, revoked_client, guard=False).execute(join_job(chat))
+    assert "JoinChannelRequest" not in revoked_client.requests
+    assert result.data["joined"]
