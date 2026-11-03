@@ -1,9 +1,13 @@
 import asyncio
+import contextvars
+import functools
 import os
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
+
+from app.async_tools import settle_cancelled
 
 
 class Database:
@@ -55,14 +59,15 @@ class Database:
         """
         async with self._async_slots:
             for attempt in range(5):
-                task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+                # An executor Future also survives asyncio.run() cancelling all
+                # Tasks during shutdown. Keep the caller's mailing context.
+                task = asyncio.get_running_loop().run_in_executor(
+                    None, contextvars.copy_context().run, functools.partial(function, *args, **kwargs)
+                )
                 try:
                     return await asyncio.shield(task)
                 except asyncio.CancelledError:
-                    try:
-                        await task
-                    except Exception:
-                        pass
+                    await settle_cancelled(task)
                     raise
                 except sqlite3.OperationalError as exc:
                     if not self.is_busy(exc) or attempt == 4:

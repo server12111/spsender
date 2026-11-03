@@ -3,6 +3,8 @@
 import asyncio
 import time
 
+from app.async_tools import settle_cancelled
+
 
 class RPCBudget:
     def __init__(self, engine):
@@ -39,6 +41,14 @@ class RPCBudget:
                     raise
 
     async def __aexit__(self, *args):
+        release = asyncio.create_task(self._release())
+        try:
+            await asyncio.shield(release)
+        except asyncio.CancelledError:
+            await settle_cancelled(release)
+            raise
+
+    async def _release(self):
         async with self.condition:
             self.active -= 1
             self.condition.notify(1)

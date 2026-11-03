@@ -790,20 +790,27 @@ async def test_runtime_survives_a_short_database_failure_in_heartbeat(env, monke
     worker.heartbeat_interval = 0.01
     original = worker.runtime_lease
     calls = []
+    recovered = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def flaky_lease():
         calls.append(True)
         if len(calls) == 2:
             raise sqlite3.OperationalError("disk I/O error")
-        return original()
+        result = original()
+        if len(calls) >= 3:
+            loop.call_soon_threadsafe(recovered.set)
+        return result
 
     monkeypatch.setattr(worker, "runtime_lease", flaky_lease)
     task = asyncio.create_task(worker.run())
-    await asyncio.sleep(0.12)
-    assert len(calls) >= 3 and not task.done()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await asyncio.wait_for(recovered.wait(), 10)
+        assert len(calls) >= 3 and not task.done()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 def test_upgrade_from_existing_v200_preserves_data_and_attempts(env, tmp_path):

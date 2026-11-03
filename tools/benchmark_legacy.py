@@ -72,14 +72,25 @@ async def run(engine, accounts, chats, count):
     probe = Probe()
 
     def runtime_for(e):
+        clients, sessions = {}, {}
+
         async def client(account_id):
-            return NativeClient(account_id, probe)
+            if account_id not in clients:
+                clients[account_id] = NativeClient(account_id, probe)
+                sessions[account_id] = await e.db.run(
+                    e.db.scalar, "SELECT encrypted_session FROM account_sessions WHERE account_id=?", (account_id,)
+                )
+            return clients[account_id]
 
         async def remember(*args):
             return None
 
         engine_context.set(e)
-        return LegacyRuntime(e, SimpleNamespace(client=client, _remember_peer=remember), "benchmark")
+        return LegacyRuntime(
+            e,
+            SimpleNamespace(client=client, clients=clients, _client_sessions=sessions, _remember_peer=remember),
+            "benchmark",
+        )
 
     runtime = runtime_for(engine)
     warm_start = time.perf_counter()

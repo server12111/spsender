@@ -55,6 +55,8 @@ class SafeLog:
 
 
 class GuardedClient:
+    preflight_timeout = 30
+
     def __init__(self, runtime, account_id, client):
         self.runtime, self.account_id, self.client = runtime, account_id, client
 
@@ -104,7 +106,7 @@ class GuardedClient:
             if target:
                 chat_lock = runtime.transport._chat_operation_locks.setdefault(target["chat_pool_id"], asyncio.Lock())
                 await stack.enter_async_context(chat_lock)
-            await runtime.guard(self.account_id)
+            await runtime.guard(self.account_id, client=self.client)
             operation = None
             request_started = False
             try:
@@ -115,10 +117,17 @@ class GuardedClient:
                     if next_at > engine.clock():
                         raise OperationError("cancelled", "JOIN_COOLDOWN")
                 if mutation and target and name in {"send_message", "send_file", "forward_messages"}:
-                    peer = await TelegramTransport._peer_entity(
-                        runtime.transport, self.client, self.account_id, target["chat_id"], target["link"]
-                    )
-                    permissions = await self.client.get_permissions(peer, "me")
+
+                    async def preflight():
+                        peer = await TelegramTransport._peer_entity(
+                            runtime.transport, self.client, self.account_id, target["chat_id"], target["link"]
+                        )
+                        return peer, await self.client.get_permissions(peer, "me")
+
+                    try:
+                        peer, permissions = await asyncio.wait_for(preflight(), self.preflight_timeout)
+                    except asyncio.TimeoutError:
+                        raise OperationError("transient", "PREFLIGHT_TIMEOUT") from None
                     if not can_publish(peer, permissions, target.get("media_kind")):
                         raise OperationError("forbidden", "PUBLICATION_FORBIDDEN")
 
@@ -140,7 +149,7 @@ class GuardedClient:
                         if target:
                             target["accepted"] = True
                         return pickle.loads(base64.b64decode(engine.secrets.decrypt(cached)))
-                await runtime.guard(self.account_id, operation)
+                await runtime.guard(self.account_id, operation, client=self.client)
                 if target and mutation:
                     sequence = await engine.db.run(
                         engine.db.scalar, "SELECT delivery_seq FROM pair_chats WHERE id=?", (target["id"],)
@@ -248,6 +257,7 @@ class LegacyRuntime:
         if not hasattr(transport, "engine"):
             transport.engine = engine
         self.database = LegacyDatabase(engine)
+        self._closing = False
         self._clients = {}
         self._warmup_pairs = set()
         self._warmup_chats = set()
@@ -280,6 +290,8 @@ class LegacyRuntime:
         transport.legacy_runtime = self
 
     async def get_client(self, account_id):
+        if self._closing or getattr(self.transport, "_closing", False):
+            return None
         if not await self.engine.db.run(self.engine.legacy_account_allowed, account_id):
             return None
         client = await self.transport.client(account_id)
@@ -303,7 +315,31 @@ class LegacyRuntime:
             if wrapped and (client is None or wrapped.client is client):
                 self._clients.pop(account_id, None)
 
-    async def guard(self, account_id, operation_id=None):
+    def prune_clients(self):
+        clients = getattr(self.transport, "clients", None)
+        if clients is None:
+            return
+        for account_id, wrapped in list(self._clients.items()):
+            if clients.get(account_id) is not wrapped.client:
+                self._clients.pop(account_id, None)
+                self._me_ids.pop(account_id, None)
+
+    async def guard(self, account_id, operation_id=None, client=None):
+        if self._closing or getattr(self.transport, "_closing", False):
+            raise OperationError("cancelled", "RUNTIME_CLOSING")
+        clients = getattr(self.transport, "clients", None)
+        if client is not None and clients is not None:
+            session = await self.engine.db.run(
+                self.engine.db.scalar,
+                "SELECT encrypted_session FROM account_sessions WHERE account_id=?",
+                (account_id,),
+            )
+            if (
+                clients.get(account_id) is not client
+                or account_id in getattr(self.transport, "_retiring", ())
+                or session != getattr(self.transport, "_client_sessions", {}).get(account_id)
+            ):
+                raise OperationError("cancelled", "STALE_ACCOUNT_CLIENT")
         busy = await self.engine.db.run(
             self.engine.db.one,
             "SELECT 1 FROM legacy_rpc_journal WHERE account_id=? AND status='INFLIGHT' AND (? IS NULL OR id<>?) LIMIT 1",
@@ -540,6 +576,7 @@ class LegacyRuntime:
                 self.service.groups._spawn(self.service.groups.cleanup_clientless())
                 self.service.groups._spawn(self.service.groups.rehide_all())
             while True:
+                self.prune_clients()
                 active = {item.id for item in await self.mailing.db.get_active_mailings()}
                 for pair_id, task in list(self.mailing._tasks.items()):
                     if pair_id not in active:
@@ -579,6 +616,7 @@ class LegacyRuntime:
             await self.close()
 
     async def close(self):
+        self._closing = True
         self.service._stopping = True
         tasks = (
             set(self.service._dialog_tasks)

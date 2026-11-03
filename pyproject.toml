@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fe-autosender"
-version = "2.2.2"
+version = "2.2.3"
 description = "Личная Telegram-админка разрешённых публикаций"
 requires-python = ">=3.11"
 dependencies = ["aiogram>=3.31,<3.32", "Telethon>=1.45,<1.46", "cryptography>=44", "python-dotenv>=1.0", "tzdata>=2025.1", "Pillow>=10", "pytz>=2024.1", "opentele-ng[pyrogram]>=1.4.0"]
