@@ -6,7 +6,90 @@ from .pairs import shift_role
 
 
 class DMSequences:
+    def _cancel_account_dm_sequences(self, c, account_id):
+        c.execute(
+            "UPDATE reply_history SET reserved_job_id=NULL WHERE reserved_job_id IN "
+            "(SELECT current_job_id FROM dm_reply_sequences WHERE account_id=? AND status IN ('ACTIVE','FAILED'))",
+            (account_id,),
+        )
+        c.execute(
+            "UPDATE dispatch_jobs SET status='CANCELLED' WHERE status='PENDING' AND id IN "
+            "(SELECT current_job_id FROM dm_reply_sequences WHERE account_id=? AND status IN ('ACTIVE','FAILED'))",
+            (account_id,),
+        )
+        c.execute(
+            "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE account_id=? AND status IN ('ACTIVE','FAILED')",
+            (account_id,),
+        )
+
+    def _fail_dm_step(self, c, job, reason):
+        if not job["kind"].startswith("DM_"):
+            return
+        sequence_id = job["payload"].get("dm_sequence_id")
+        if sequence_id is not None:
+            c.execute(
+                "UPDATE dm_reply_sequences SET status='FAILED' WHERE id=? AND current_job_id=? AND status='ACTIVE'",
+                (sequence_id, job["id"]),
+            )
+        c.execute("UPDATE reply_history SET reserved_job_id=NULL WHERE reserved_job_id=?", (job["id"],))
+        self._notify(
+            c,
+            f"reply-failed:{job['id']}:{job['attempt_id']}",
+            "reply_failed",
+            {
+                "account_id": job["account_id"],
+                "peer_id": job["payload"]["peer_id"],
+                "reason": reason,
+                "campaign_id": job["campaign_id"],
+                "job_id": job["id"],
+                "campaign_paused": row(c, "SELECT status FROM campaigns WHERE id=?", (job["campaign_id"],))["status"]
+                != "RUNNING",
+            },
+        )
+
+    def _reactivate_dm_sequence(self, c, sequence):
+        if sequence["status"] != "FAILED":
+            return sequence["status"] == "ACTIVE"
+        if row(
+            c,
+            "SELECT 1 FROM dm_reply_sequences WHERE campaign_id=? AND peer_id=? AND status='ACTIVE'",
+            (sequence["campaign_id"], sequence["peer_id"]),
+        ):
+            return False
+        job = row(c, "SELECT status FROM dispatch_jobs WHERE id=?", (sequence["current_job_id"],))
+        if job and job["status"] not in {"FAILED", "CANCELLED"}:
+            return False
+        c.execute("UPDATE dm_reply_sequences SET status='ACTIVE' WHERE id=?", (sequence["id"],))
+        c.execute(
+            "UPDATE dispatch_jobs SET status='CANCELLED' WHERE id=? AND status='FAILED'", (sequence["current_job_id"],)
+        )
+        return True
+
+    def _resume_failed_dm_sequences(self, c, campaign_id):
+        # Explicit campaign resume retries only known failures. UNKNOWN is never touched.
+        c.execute(
+            "UPDATE dm_reply_sequences SET status='ACTIVE' WHERE id IN ("
+            "SELECT max(s.id) FROM dm_reply_sequences s JOIN campaign_members m "
+            "ON m.account_id=s.account_id AND m.campaign_id=s.campaign_id "
+            "JOIN pairs p ON p.id=s.pair_id AND s.account_id IN (p.account_a_id,p.account_b_id) "
+            "LEFT JOIN dispatch_jobs j ON j.id=s.current_job_id "
+            "WHERE s.campaign_id=? AND s.status='FAILED' AND (j.id IS NULL OR j.status IN ('FAILED','CANCELLED')) "
+            "AND NOT EXISTS(SELECT 1 FROM dm_reply_sequences active WHERE active.campaign_id=s.campaign_id "
+            "AND active.peer_id=s.peer_id AND active.status='ACTIVE') GROUP BY s.peer_id)",
+            (campaign_id,),
+        )
+        c.execute(
+            "UPDATE dispatch_jobs SET status='CANCELLED' WHERE status='FAILED' AND id IN "
+            "(SELECT current_job_id FROM dm_reply_sequences WHERE campaign_id=? AND status='ACTIVE')",
+            (campaign_id,),
+        )
+
     def _create_dm_sequence(self, c, pair, campaign, account_id, peer_id, message_id, steps):
+        # A new account taking over this peer supersedes known failures, never UNKNOWN.
+        c.execute(
+            "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE campaign_id=? AND peer_id=? AND status='FAILED'",
+            (campaign["id"], peer_id),
+        )
         sequence_id = c.execute(
             "INSERT INTO dm_reply_sequences(campaign_id,pair_id,account_id,peer_id,reply_to,version,steps,created_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
@@ -22,16 +105,16 @@ class DMSequences:
             ),
         ).lastrowid
         sequence = row(c, "SELECT * FROM dm_reply_sequences WHERE id=?", (sequence_id,))
-        job_id = self._queue_dm_step(c, sequence, pair, campaign)
-        if job_id is None:
-            c.execute("DELETE FROM dm_reply_sequences WHERE id=?", (sequence_id,))
-        return job_id
+        # Keep durable intent even when the bounded job queue is temporarily full.
+        return self._queue_dm_step(c, sequence, pair, campaign)
 
     def _queue_dm_step(self, c, sequence, pair, campaign):
         if campaign["status"] != "RUNNING" or not self._pair_ready(c, pair):
             return None
         active = pair["account_a_id"] if shift_role(self.clock(), campaign["timezone"]) == "A" else pair["account_b_id"]
         if active != sequence["account_id"]:
+            return None
+        if not self._reactivate_dm_sequence(c, sequence):
             return None
         steps = json.loads(sequence["steps"])
         index = sequence["step_index"]
@@ -130,7 +213,10 @@ class DMSequences:
         candidates = rows(
             c,
             "SELECT s.* FROM dm_reply_sequences s LEFT JOIN dispatch_jobs j ON j.id=s.current_job_id "
-            "WHERE s.pair_id=? AND s.account_id=? AND s.status='ACTIVE' AND (j.id IS NULL OR j.status='CANCELLED' "
+            "WHERE s.pair_id=? AND s.account_id=? AND (s.status='ACTIVE' OR (s.status='FAILED' AND s.version<>? "
+            "AND NOT EXISTS(SELECT 1 FROM dm_reply_sequences active WHERE active.campaign_id=s.campaign_id "
+            "AND active.peer_id=s.peer_id AND active.status='ACTIVE'))) "
+            "AND (j.id IS NULL OR j.status='CANCELLED' "
             "OR (j.status='FAILED' AND j.version<>?)) "
             "AND ((json_extract(s.steps,'$['||s.step_index||'].history_kind')='dm_first' AND ?=1) "
             "OR (json_extract(s.steps,'$['||s.step_index||'].history_kind')='dm_always' AND ?=1)) "
@@ -139,6 +225,7 @@ class DMSequences:
             (
                 pair["id"],
                 active,
+                campaign["version"],
                 campaign["version"],
                 campaign["dm_first_enabled"],
                 campaign["dm_always_enabled"],

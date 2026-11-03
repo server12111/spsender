@@ -1,11 +1,25 @@
-from .core import DomainError, rows
+from .core import DomainError, row, rows
 
 
 class Campaigns:
-    def create_campaign(self, name, texts, interval=300, chat_limit=20, **options):
+    def create_campaign(
+        self, name, texts, interval=300, chat_limit=20, *, account_ids=(), creation_key=None, **options
+    ):
         if not name.strip() or not texts or interval < 1 or chat_limit < 1:
             raise DomainError("Нужны название, текст, положительные интервал и N")
         with self.db.tx() as c:
+            if creation_key:
+                receipt = row(
+                    c, "SELECT campaign_id FROM campaign_creation_receipts WHERE creation_key=?", (creation_key,)
+                )
+                if receipt:
+                    return receipt["campaign_id"]
+            account_ids = list(dict.fromkeys(account_ids))
+            for account_id in account_ids:
+                if not row(c, "SELECT id FROM accounts WHERE id=? AND account_health<>'REMOVED'", (account_id,)):
+                    raise DomainError("Выбранный аккаунт удалён. Откройте выбор аккаунтов заново")
+                if row(c, "SELECT 1 FROM campaign_members WHERE account_id=?", (account_id,)):
+                    raise DomainError("Выбранный аккаунт уже назначен другой рассылке")
             campaign_id = c.execute(
                 "INSERT INTO campaigns(name,timezone,interval_seconds,chat_limit,created_at) VALUES (?,?,?,?,?)",
                 (
@@ -18,6 +32,10 @@ class Campaigns:
             ).lastrowid
             self._write_templates(c, campaign_id, 1, "mailing", texts)
             self._campaign_options(c, campaign_id, options)
+            for account_id in account_ids:
+                self._assign_account(c, account_id, campaign_id)
+            if creation_key:
+                c.execute("INSERT INTO campaign_creation_receipts VALUES (?,?)", (creation_key, campaign_id))
             self.audit(c, "CAMPAIGN_CREATED", campaign_id=campaign_id)
             return campaign_id
 
@@ -130,12 +148,17 @@ class Campaigns:
                     "UPDATE dispatch_jobs SET status='CANCELLED' WHERE campaign_id=? AND status='FAILED' AND kind IN ('CHECK','JOIN','GREETING')",
                     (campaign_id,),
                 )
+                self._resume_failed_dm_sequences(c, campaign_id)
             if status != "RUNNING":
                 c.execute(
                     "UPDATE dispatch_jobs SET status='CANCELLED' WHERE campaign_id=? AND status='PENDING'",
                     (campaign_id,),
                 )
             if status == "REMOVED":
+                c.execute(
+                    "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE campaign_id=? AND status IN ('ACTIVE','FAILED')",
+                    (campaign_id,),
+                )
                 for assignment in rows(
                     c,
                     "SELECT pc.* FROM pair_chats pc JOIN pairs p ON p.id=pc.pair_id "

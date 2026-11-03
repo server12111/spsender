@@ -16,6 +16,10 @@ from app.services.chat_pool import parse_target
 from .base import OperationError, Result
 from .session import BoundedStringSession
 
+MANUAL_VERIFICATION = re.compile(
+    r"captcha|капч\w*|я\s+не\s+робот|verify.*human|подтверд\w*.*человек|пройд\w*.*проверк", re.I
+)
+
 
 def classify_error(exc):
     name = type(exc).__name__
@@ -40,6 +44,11 @@ def classify_error(exc):
         "ChatSendPlainForbiddenError",
         "ChatSendMediaForbiddenError",
         "ChannelPrivateError",
+        "ChatSendPhotosForbiddenError",
+        "ChatSendVideosForbiddenError",
+        "ChatSendDocsForbiddenError",
+        "ChatSendStickersForbiddenError",
+        "ChatRestrictedError",
     }:
         return OperationError("forbidden", "PUBLICATION_FORBIDDEN")
     if name in {"InviteRequestSentError", "JoinRequestSentError"}:
@@ -56,6 +65,10 @@ def classify_error(exc):
         return OperationError("chat", "CHAT_UNAVAILABLE")
     if name in {"SlowModeWaitError"}:
         return OperationError("flood", "SLOW_MODE_WAIT", max(1, exc.seconds))
+    if name in {"UserIsBlockedError", "YouBlockedUserError", "UserPrivacyRestrictedError", "UserNotMutualContactError"}:
+        return OperationError("recipient", "RECIPIENT_UNAVAILABLE")
+    if name in {"MessageTooLongError", "MediaCaptionTooLongError", "MessageEmptyError", "StickerInvalidError"}:
+        return OperationError("configuration", name)
     # Timeout/connection loss may happen AFTER Telegram accepted the request.
     return OperationError("unknown", name)
 
@@ -163,6 +176,11 @@ class TelegramTransport:
                 if classified.category == "unknown":
                     classified = OperationError("transient", type(exc).__name__)
                 raise classified from None
+            try:
+                await self.engine.db.run(self.engine.connection_succeeded, account_id)
+            except BaseException:
+                await asyncio.wait_for(client.disconnect(), 5)
+                raise
             self.clients[account_id] = client
             self._client_sessions[account_id] = account["encrypted_session"]
             self._start_incoming()
@@ -216,9 +234,7 @@ class TelegramTransport:
                 or current["flood_until"] > self.engine.clock()
             ):
                 return
-            gate = re.search(
-                r"captcha|????|? ?? ?????|verify.*human|???????????.*???????|?????.*??????", event.raw_text or "", re.I
-            )
+            gate = MANUAL_VERIFICATION.search(event.raw_text or "")
             if not event.is_private and not event.is_reply and not gate:
                 return
             sender = await asyncio.wait_for(event.get_sender(), 30)
@@ -252,6 +268,8 @@ class TelegramTransport:
             classified = classify_error(exc)
             if classified.category == "critical":
                 await self.engine.db.run(self.engine.critical, account_id, classified.code)
+            elif classified.category == "flood":
+                await self.engine.db.run(self.engine.flood_wait, account_id, classified.seconds)
             else:
                 await self.engine.db.run(self.engine.diagnostic, "incoming", exc, account_id=account_id)
 
@@ -289,15 +307,7 @@ class TelegramTransport:
                     if error.category == "critical":
                         await self.engine.db.run(self.engine.critical, account["id"], error.code)
                     elif error.category == "flood":
-
-                        def flood():
-                            with self.engine.db.tx() as c:
-                                c.execute(
-                                    "UPDATE accounts SET flood_until=? WHERE id=?",
-                                    (self.engine.clock() + error.seconds, account["id"]),
-                                )
-
-                        await self.engine.db.run(flood)
+                        await self.engine.db.run(self.engine.flood_wait, account["id"], error.seconds)
                     else:
                         await self.engine.db.run(self.engine.diagnostic, "connection", error, account_id=account["id"])
 
@@ -379,9 +389,11 @@ class TelegramTransport:
         # Broadcast posts have no conversation typing indicator.
         if not getattr(peer, "broadcast", False):
             await asyncio.wait_for(
-                client(functions.messages.SetTypingRequest(
-                    peer, types.SendMessageTypingAction(), top_msg_id=payload.get("topic_id") or None
-                )),
+                client(
+                    functions.messages.SetTypingRequest(
+                        peer, types.SendMessageTypingAction(), top_msg_id=payload.get("topic_id") or None
+                    )
+                ),
                 timeout=10,
             )
         await self.guard(job)

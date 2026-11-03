@@ -41,6 +41,7 @@ LABELS = {
     "CLOSED": "Закрыто",
     "FLOOD_WAIT": "Временный лимит Telegram",
     "PUBLICATION_FORBIDDEN": "Публикация запрещена",
+    "RECIPIENT_UNAVAILABLE": "Собеседник недоступен или заблокирован",
     "CHAT_UNAVAILABLE": "Чат недоступен",
     "SLOW_MODE_WAIT": "Медленный режим",
     "MODERATOR_APPROVAL_REQUIRED": "Нужно одобрение модератора",

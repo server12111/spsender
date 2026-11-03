@@ -9,6 +9,14 @@ from .pairs import active_count, shift_role
 class Dispatch:
     def _enqueue(self, c, pair, campaign, kind, chat_id, account_id, payload, key, planned_at=None, budget=None):
         existing = row(c, "SELECT * FROM dispatch_jobs WHERE idempotency_key=?", (key,))
+        if existing and (existing["pair_id"] != pair["id"] or existing["campaign_id"] != campaign["id"]):
+            if existing["status"] in {"INFLIGHT", "UNKNOWN"} or (
+                existing["status"] == "CONFIRMED" and kind not in {"CHECK", "JOIN"}
+            ):
+                return None
+            # Keep historical attempts attached to their original pair/campaign.
+            key = f"{key}:scope:{campaign['id']}:{pair['id']}"
+            existing = row(c, "SELECT * FROM dispatch_jobs WHERE idempotency_key=?", (key,))
         if existing and existing["status"] == "FAILED" and existing["version"] != campaign["version"]:
             c.execute("UPDATE dispatch_jobs SET status='CANCELLED' WHERE id=?", (existing["id"],))
             existing["status"] = "CANCELLED"
@@ -128,6 +136,7 @@ class Dispatch:
             c.execute("UPDATE campaigns SET template_cursor=? WHERE id=?", (cursor, campaign["id"]))
 
     def tick(self, pair_limit=None):
+        limit = pair_limit if pair_limit is not None else self.runtime_options()["planning_batch_size"]
         with self.db.tx() as c:
             for account in rows(
                 c,
@@ -138,7 +147,6 @@ class Dispatch:
             self._fill_waiting(c)
             cursor = row(c, "SELECT value FROM settings WHERE key='planner_cursor'")
             cursor = int(cursor["value"]) if cursor else 0
-            limit = pair_limit or self.config.planning_batch_size
             selected = rows(
                 c,
                 "SELECT p.id FROM pairs p JOIN campaigns ca ON ca.id=p.campaign_id WHERE ca.status<>'REMOVED' AND p.account_a_id IS NOT NULL AND p.id>? ORDER BY p.id LIMIT ?",
@@ -159,17 +167,25 @@ class Dispatch:
                 record = row(c, "SELECT status FROM campaigns WHERE id=?", (pair["campaign_id"],))
                 if not record or record["status"] == "REMOVED":
                     continue
+                pending_before = row(c, "SELECT value FROM queue_counters WHERE name='pending'")["value"]
                 campaign = self.campaign(c, pair["campaign_id"])
                 self._onboard(c, pair, campaign)
                 pair = self._pair(c, pair["id"])
                 self._sync_pair(c, pair)
                 pair = self._pair(c, pair["id"])
-                self._plan_dispatch(c, pair, campaign)
                 self._plan_dm_sequences(c, pair, campaign)
+                self._plan_dispatch(c, pair, campaign)
                 c.execute(
                     "INSERT INTO settings VALUES ('planner_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(pair["id"]),),
                 )
+                pending_after = row(c, "SELECT value FROM queue_counters WHERE name='pending'")["value"]
+                if pending_after > pending_before and pending_after >= int(
+                    row(c, "SELECT value FROM settings WHERE key='max_pending_jobs'")["value"]
+                ):
+                    # Resume at the next pair when capacity returns, rather than
+                    # letting the first pair refill every available queue slot.
+                    break
         self.hourly_summary()
 
     def _job_allowed(self, c, job, account, pair, campaign):
@@ -179,8 +195,11 @@ class Dispatch:
         if "dm_sequence_id" in payload:
             sequence = row(c, "SELECT * FROM dm_reply_sequences WHERE id=?", (payload["dm_sequence_id"],))
             if (
-                not sequence or sequence["status"] != "ACTIVE" or sequence["next_step_at"] > self.clock()
-                or sequence["step_index"] != payload["dm_step"] or sequence["current_job_id"] != job["id"]
+                not sequence
+                or sequence["status"] != "ACTIVE"
+                or sequence["next_step_at"] > self.clock()
+                or sequence["step_index"] != payload["dm_step"]
+                or sequence["current_job_id"] != job["id"]
             ):
                 return False
         if job["kind"] == "DM_MANUAL":
@@ -232,11 +251,13 @@ class Dispatch:
         if job["chat_pool_id"] is not None:
             chat = row(
                 c,
-                "SELECT pc.*,cp.approved,cp.greeting_allowed,cp.split_allowed FROM pair_chats pc JOIN chat_pool cp ON cp.id=pc.chat_pool_id "
+                "SELECT pc.*,cp.approved,cp.join_allowed,cp.greeting_allowed,cp.split_allowed FROM pair_chats pc JOIN chat_pool cp ON cp.id=pc.chat_pool_id "
                 "WHERE pair_id=? AND chat_pool_id=? AND removed_at IS NULL",
                 (pair["id"], job["chat_pool_id"]),
             )
             if not chat or chat["status"] != "ASSIGNED" or not chat["approved"]:
+                return False
+            if job["kind"] == "JOIN" and payload.get("join_allowed") and not chat["join_allowed"]:
                 return False
             if job["kind"] != "JOIN":
                 access = row(
@@ -465,12 +486,7 @@ class Dispatch:
             if error.category == "critical":
                 self._critical(c, job["account_id"], error.code, error.code)
             elif error.category == "flood":
-                c.execute(
-                    "UPDATE accounts SET flood_until=?,last_error='FLOOD_WAIT' WHERE id=?",
-                    (self.clock() + error.seconds, job["account_id"]),
-                )
-                pair = self._pair(c, job["pair_id"])
-                self._pause_clock(c, pair)
+                self._flood_wait(c, job["account_id"], error.seconds)
                 c.execute(
                     "UPDATE dispatch_jobs SET status='PENDING',planned_at=?,retry_count=retry_count+1 WHERE id=?",
                     (self.clock() + max(1, error.seconds), job["id"]),
@@ -527,20 +543,24 @@ class Dispatch:
                     c, job["pair_id"], job["chat_pool_id"], job["account_id"], error.code, error.category == "forbidden"
                 )
             elif error.category == "configuration":
-                c.execute("UPDATE campaigns SET status='PAUSED' WHERE id=? AND status='RUNNING'", (job["campaign_id"],))
-                c.execute(
-                    "UPDATE dispatch_jobs SET status='CANCELLED' WHERE campaign_id=? AND status='PENDING'",
-                    (job["campaign_id"],),
-                )
-                for pair in rows(c, "SELECT * FROM pairs WHERE campaign_id=?", (job["campaign_id"],)):
-                    self._pause_clock(c, pair)
-                self._notify(
-                    c,
-                    f"configuration:{job['campaign_id']}:{job['version']}",
-                    "campaign_error",
-                    {"campaign_id": job["campaign_id"], "reason": error.code},
-                    80,
-                )
+                paused = c.execute(
+                    "UPDATE campaigns SET status='PAUSED' WHERE id=? AND version=? AND status='RUNNING'",
+                    (job["campaign_id"], job["version"]),
+                ).rowcount
+                if paused:
+                    c.execute(
+                        "UPDATE dispatch_jobs SET status='CANCELLED' WHERE campaign_id=? AND status='PENDING'",
+                        (job["campaign_id"],),
+                    )
+                    for pair in rows(c, "SELECT * FROM pairs WHERE campaign_id=?", (job["campaign_id"],)):
+                        self._pause_clock(c, pair)
+                    self._notify(
+                        c,
+                        f"configuration:{job['campaign_id']}:{job['version']}",
+                        "campaign_error",
+                        {"campaign_id": job["campaign_id"], "reason": error.code},
+                        80,
+                    )
             if status == "UNKNOWN":
                 self._notify(
                     c, f"unknown:{job['id']}", "unknown", {"job_id": job["id"], "account_id": job["account_id"]}, 80
@@ -548,6 +568,9 @@ class Dispatch:
             campaign = row(c, "SELECT status,version FROM campaigns WHERE id=?", (job["campaign_id"],))
             if not campaign or campaign["status"] != "RUNNING" or campaign["version"] != job["version"]:
                 c.execute("UPDATE dispatch_jobs SET status='CANCELLED' WHERE id=? AND status='PENDING'", (job["id"],))
+            terminal = row(c, "SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],))
+            if terminal["status"] == "FAILED":
+                self._fail_dm_step(c, job, error.code)
             self.audit(
                 c,
                 "JOB_ERROR",

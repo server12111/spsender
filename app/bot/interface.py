@@ -145,10 +145,10 @@ class Interface:
         }
         return View(
             "📦 Очередь и повторы\n\nНажмите параметр, чтобы изменить. Задержки — в секундах.",
-            grid([
-                self.button(user, f"{titles[key]}: {value}", "form", {"field": key})
-                for key, value in options.items()
-            ]) + self.nav(user, "settings"),
+            grid(
+                [self.button(user, f"{titles[key]}: {value}", "form", {"field": key}) for key, value in options.items()]
+            )
+            + self.nav(user, "settings"),
         )
 
     def listing(self, user, section, page=0, search="", status="", period="today"):
@@ -178,10 +178,14 @@ class Interface:
             return self.errors(user, period, page)
         if section in {"greetings", "auto"}:
             records = self.e.db.all("SELECT id,name FROM campaigns WHERE status<>'REMOVED' ORDER BY id")
-            buttons = grid([
-                self.button(user, f"№{r['id']} {r['name'][:22]}", "templates_hub", {"id": r["id"], "section": section})
-                for r in records[page * 8 : page * 8 + 8]
-            ])
+            buttons = grid(
+                [
+                    self.button(
+                        user, f"№{r['id']} {r['name'][:22]}", "templates_hub", {"id": r["id"], "section": section}
+                    )
+                    for r in records[page * 8 : page * 8 + 8]
+                ]
+            )
             if section == "greetings":
                 buttons.append([self.button(user, "👋 Пул 30 эмодзи / 100 фраз", "pool")])
             self.pagination(buttons, user, "list", {"section": section}, page, len(records) > page * 8 + 8)
@@ -208,7 +212,8 @@ class Interface:
         if section == "accounts":
             where += " AND account_health<>'REMOVED'"
         if section == "pairs":
-            where += " AND account_a_id IS NOT NULL"
+            where += " AND account_a_id IS NOT NULL AND EXISTS(SELECT 1 FROM campaigns ca "
+            where += "WHERE ca.id=pairs.campaign_id AND ca.status<>'REMOVED')"
         records = self.e.db.all(f"SELECT * FROM {table}" + where + " ORDER BY id LIMIT 9 OFFSET ?", (*args, page * 8))
         count = self.e.db.scalar(f"SELECT count(*) FROM {table}" + where, args)
         buttons = []
@@ -219,11 +224,21 @@ class Interface:
                 else f"A №{r['account_a_id']} / B №{r['account_b_id'] or '—'}"
             )
             status_icon = {
-                "RUNNING": "🟢", "READY": "🟢", "OK": "🟢", "FREE": "🟢",
-                "DRAFT": "📝", "PAUSED": "⏸", "STOPPED": "⏹",
-                "PREPARING": "⏳", "WAITING_PARTNER": "⏳", "WAITING_CHATS": "⏳",
-                "WAITING_REPLACEMENT": "⏳", "ASSIGNED": "🔗",
-                "DISCONNECTED": "🔌", "FROZEN": "🔴", "RESTRICTED": "🔴",
+                "RUNNING": "🟢",
+                "READY": "🟢",
+                "OK": "🟢",
+                "FREE": "🟢",
+                "DRAFT": "📝",
+                "PAUSED": "⏸",
+                "STOPPED": "⏹",
+                "PREPARING": "⏳",
+                "WAITING_PARTNER": "⏳",
+                "WAITING_CHATS": "⏳",
+                "WAITING_REPLACEMENT": "⏳",
+                "ASSIGNED": "🔗",
+                "DISCONNECTED": "🔌",
+                "FROZEN": "🔴",
+                "RESTRICTED": "🔴",
             }.get(r[status_column], "⚠️")
             if section == "accounts" and r["paused"]:
                 status_icon = "⏸"
@@ -343,15 +358,24 @@ class Interface:
             text += f"\n\n№{account['id']} · {account['name'][:40]}\n{self.preparation_hint(account)}"
         if not accounts:
             text += "\n\n" + ("На этой странице аккаунтов нет." if page else "Добавьте первый аккаунт.")
-        buttons = grid([
-            self.button(user, f"👤 №{account['id']} {account['name'][:20]}", "card", {"section": "accounts", "id": account["id"]})
-            for account in accounts[:8]
-        ])
+        buttons = grid(
+            [
+                self.button(
+                    user,
+                    f"👤 №{account['id']} {account['name'][:20]}",
+                    "card",
+                    {"section": "accounts", "id": account["id"]},
+                )
+                for account in accounts[:8]
+            ]
+        )
         self.pagination(buttons, user, "list", {"section": "preparation"}, page, len(accounts) > 8)
-        buttons += [[
-            self.button(user, "💬 Пул чатов", "list", {"section": "chats"}),
-            self.button(user, "👋 Приветствия", "list", {"section": "greetings"}),
-        ]]
+        buttons += [
+            [
+                self.button(user, "💬 Пул чатов", "list", {"section": "chats"}),
+                self.button(user, "👋 Приветствия", "list", {"section": "greetings"}),
+            ]
+        ]
         return View(text, buttons + self.nav(user))
 
     def pagination(self, buttons, user, action, data, page, more):
@@ -428,7 +452,7 @@ class Interface:
                             "v": r["version"],
                         },
                         True,
-                    )
+                    ),
                 ],
                 [
                     b("📝 Тексты и медиа", "templates", {"kind": "mailing"}),
@@ -453,8 +477,11 @@ class Interface:
             start, pause = buttons[0]
             stop = buttons[1][0]
             buttons[:2] = (
-                [[pause, stop]] if r["status"] == "RUNNING"
-                else [[start, stop]] if r["status"] == "PAUSED" else [[start]]
+                [[pause, stop]]
+                if r["status"] == "RUNNING"
+                else [[start, stop]]
+                if r["status"] == "PAUSED"
+                else [[start]]
             )
         elif section == "accounts":
             r = self.e.db.one("SELECT * FROM accounts WHERE id=?", (item_id,))
@@ -464,7 +491,11 @@ class Interface:
                 "SELECT ca.* FROM campaigns ca JOIN campaign_members m ON m.campaign_id=ca.id WHERE m.account_id=?",
                 (item_id,),
             )
-            pair = self.e.db.one("SELECT * FROM pairs WHERE account_a_id=? OR account_b_id=?", (item_id, item_id))
+            pair = self.e.db.one(
+                "SELECT p.* FROM pairs p JOIN campaigns ca ON ca.id=p.campaign_id "
+                "WHERE ca.status<>'REMOVED' AND (p.account_a_id=? OR p.account_b_id=?)",
+                (item_id, item_id),
+            )
             shift = "Ожидает партнёра"
             n = 0
             if pair:
@@ -511,10 +542,11 @@ class Interface:
                 partner_id = pair["account_b_id"] if pair["account_a_id"] == item_id else pair["account_a_id"]
                 partner = self.e.db.one("SELECT name FROM accounts WHERE id=?", (partner_id,)) if partner_id else None
                 text += "\n\n🔄 " + (
-                    f"Партнёр: {partner['name']}"
-                    if partner else "Партнёр добавится автоматически из этой рассылки."
+                    f"Партнёр: {partner['name']}" if partner else "Партнёр добавится автоматически из этой рассылки."
                 )
-                buttons[1].insert(0, self.button(user, "🔄 Открыть пару", "card", {"section": "pairs", "id": pair["id"]}))
+                buttons[1].insert(
+                    0, self.button(user, "🔄 Открыть пару", "card", {"section": "pairs", "id": pair["id"]})
+                )
             else:
                 text += "\n\n🔄 Назначьте рассылку — бот сам сформирует пару."
         elif section == "pairs":
@@ -542,7 +574,8 @@ class Interface:
             buttons = [[b("💬 Общие чаты", "pair_chats", {"page": 0})]]
             members_buttons = [
                 self.button(user, f"👤 Аккаунт {role}", "card", {"section": "accounts", "id": account_id})
-                for role, account_id in (("A", r["account_a_id"]), ("B", r["account_b_id"])) if account_id
+                for role, account_id in (("A", r["account_a_id"]), ("B", r["account_b_id"]))
+                if account_id
             ]
             buttons += grid(members_buttons)
         elif section == "chats":
@@ -588,18 +621,22 @@ class Interface:
         text += f"📣 Рассылок: {s['totals']['campaigns']}\n\n📨 Подтверждено: {s['confirmed']}\nПопыток: {s['attempts']} · Ошибок: {s['errors']}\nНужна сверка: {s['unknown']} · Проблемных чатов: {s['pending_issues']}"
         if details:
             for table, title in (
-                ("accounts", "Аккаунты"), ("pairs", "Пары"), ("chat_pool", "Чаты"), ("campaigns", "Рассылки"),
+                ("accounts", "Аккаунты"),
+                ("pairs", "Пары"),
+                ("chat_pool", "Чаты"),
+                ("campaigns", "Рассылки"),
             ):
                 if s["statuses"][table]:
-                    text += "\n\n" + title + "\n" + " · ".join(
-                        f"{label(k)}: {v}" for k, v in s["statuses"][table].items()
+                    text += (
+                        "\n\n" + title + "\n" + " · ".join(f"{label(k)}: {v}" for k, v in s["statuses"][table].items())
                     )
             text += "\n\nОтправки / ошибки по периодам\n" + "\n".join(
                 f"{PERIODS[key]}: {values['confirmed']} / {values['errors']}"
                 for key, values in self.e.period_metrics().items()
             )
             text += "\n\nПо дням\n" + (
-                "\n".join(f"{day}: {value} {'▰' * min(20, value)}" for day, value in s["days"].items()) or "Нет отправок"
+                "\n".join(f"{day}: {value} {'▰' * min(20, value)}" for day, value in s["days"].items())
+                or "Нет отправок"
             )
             text += "\n\nПоследние события\n" + "\n".join(
                 f"{self.time(r['created_at'])} · {label(r['event'])}" for r in s["last_events"][:5]
@@ -608,8 +645,18 @@ class Interface:
             self.button(user, SECTIONS[section], "list", {"section": section, "period": period})
             for section in ("accounts", "pairs", "chats", "campaigns", "errors")
         ]
-        controls.append(self.button(user, "📊 Кратко" if details else "📈 Подробности", "stats_details", {"period": period, "details": not details}))
-        return View(text[:3900], grid(controls) + [[self.button(user, "📅 Период", "periods", {"return": "stats"})]] + self.nav(user))
+        controls.append(
+            self.button(
+                user,
+                "📊 Кратко" if details else "📈 Подробности",
+                "stats_details",
+                {"period": period, "details": not details},
+            )
+        )
+        return View(
+            text[:3900],
+            grid(controls) + [[self.button(user, "📅 Период", "periods", {"return": "stats"})]] + self.nav(user),
+        )
 
     def errors(self, user, period="all", page=0, section=None, item_id=None):
         records = self.e.error_history(period, section, item_id, page)
@@ -748,10 +795,12 @@ class Interface:
                 ]
             )
             buttons.append([b("⏱ Cooldown ответов", "form", {"field": "reply_cooldown"})])
-            buttons.append([
-                b("👋 Привет в ЛС", "form", {"field": "dm_greeting_phrase"}),
-                b("🎟 Стикер: " + r["dm_sticker_emoji"], "form", {"field": "dm_sticker_emoji"}),
-            ])
+            buttons.append(
+                [
+                    b("👋 Привет в ЛС", "form", {"field": "dm_greeting_phrase"}),
+                    b("🎟 Стикер: " + r["dm_sticker_emoji"], "form", {"field": "dm_sticker_emoji"}),
+                ]
+            )
             buttons.append([b("🧹 Очистить историю автоответов", "confirm", {"do": "clear_reply_history"})])
         return View(
             SECTIONS[section]
@@ -765,7 +814,9 @@ class Interface:
         )
 
     def template_list(self, user, campaign_id, kind, page=0):
-        templates = self.e.templates(campaign_id, kind)
+        with self.e.db.read() as c:
+            version = self.e.campaign(c, campaign_id)["version"]
+            templates = self.e.templates(campaign_id, kind, version, c)
         buttons = []
         text = "📝 Шаблоны\n"
         for index, t in enumerate(templates[page * 6 : page * 6 + 6], page * 6):
@@ -774,7 +825,10 @@ class Interface:
                 [
                     self.button(user, f"👁 №{index + 1}", "preview", {"id": campaign_id, "kind": kind, "index": index}),
                     self.button(
-                        user, f"✏️ №{index + 1}", "template_edit", {"id": campaign_id, "kind": kind, "index": index}
+                        user,
+                        f"✏️ №{index + 1}",
+                        "template_edit",
+                        {"id": campaign_id, "kind": kind, "index": index, "v": version},
                     ),
                     self.button(
                         user,
@@ -785,13 +839,20 @@ class Interface:
                             "kind": kind,
                             "index": index,
                             "do": "template_remove",
-                            "v": self.e.db.scalar("SELECT version FROM campaigns WHERE id=?", (campaign_id,)),
+                            "v": version,
                         },
                     ),
                 ]
             )
         buttons.append(
-            [self.button(user, "➕ Текст / фото / видео / файл", "template_edit", {"id": campaign_id, "kind": kind})]
+            [
+                self.button(
+                    user,
+                    "➕ Текст / фото / видео / файл",
+                    "template_edit",
+                    {"id": campaign_id, "kind": kind, "v": version},
+                )
+            ]
         )
         self.pagination(
             buttons, user, "templates", {"id": campaign_id, "kind": kind}, page, len(templates) > page * 6 + 6
@@ -799,6 +860,7 @@ class Interface:
         return View(text if templates else text + "Добавьте первый шаблон", buttons + self.nav(user, "campaigns"))
 
     def wizard(self, user, data):
+        data.setdefault("_draft_id", secrets.token_hex(16))
         self.set_state(user, "campaign_wizard", data)
         step = data["step"]
         buttons = []
@@ -952,12 +1014,14 @@ class Interface:
             values = await self.e.db.run(self.e.db.all, f"SELECT DISTINCT {col} AS status FROM {table}")
             return View(
                 "🔽 Фильтр статуса",
-                grid([
-                    await self.e.db.run(
-                        self.button, user, label(r["status"]), "list", {"section": section, "status": r["status"]}
-                    )
-                    for r in values
-                ])
+                grid(
+                    [
+                        await self.e.db.run(
+                            self.button, user, label(r["status"]), "list", {"section": section, "status": r["status"]}
+                        )
+                        for r in values
+                    ]
+                )
                 + [[await self.e.db.run(self.button, user, "Все", "list", {"section": section})]]
                 + await self.e.db.run(self.nav, user, section),
             )
@@ -1045,7 +1109,12 @@ class Interface:
         if action == "templates":
             return await self.e.db.run(self.template_list, user, item_id, data["kind"], data.get("page", 0))
         if action == "template_edit":
-            data["v"] = await self.e.db.run(self.e.db.scalar, "SELECT version FROM campaigns WHERE id=?", (item_id,))
+            if "index" in data and "v" not in data:
+                raise DomainError("Кнопка устарела. Откройте список шаблонов заново")
+            if "v" not in data:
+                data["v"] = await self.e.db.run(
+                    self.e.db.scalar, "SELECT version FROM campaigns WHERE id=?", (item_id,)
+                )
             await self.e.db.run(self.set_state, user, "template_edit", data)
             return View(
                 "Шаг 1 из 1\nОтправьте текст, фото, видео или файл с подписью.", await self.e.db.run(self.cancel, user)
@@ -1111,13 +1180,13 @@ class Interface:
                     form["texts"],
                     form["interval"],
                     form["limit"],
+                    account_ids=form["accounts"],
+                    creation_key=form["_draft_id"],
                     **{
                         k: form.get(k, False)
                         for k in ("greeting_enabled", "group_reply_enabled", "dm_first_enabled", "dm_always_enabled")
                     },
                 )
-                for account_id in form["accounts"]:
-                    await self.e.db.run(self.e.assign_account, account_id, campaign_id)
                 await self.e.db.run(self.clear, user)
                 return await self.e.db.run(self.card, user, "campaigns", campaign_id)
             return await self.e.db.run(self.wizard, user, form)
@@ -1125,7 +1194,8 @@ class Interface:
             page = max(0, int(data.get("page", 0)))
             if action == "account_campaign":
                 records = await self.e.db.run(
-                    self.e.db.all, "SELECT id,name FROM campaigns WHERE status<>'REMOVED' ORDER BY id LIMIT 9 OFFSET ?",
+                    self.e.db.all,
+                    "SELECT id,name FROM campaigns WHERE status<>'REMOVED' ORDER BY id LIMIT 9 OFFSET ?",
                     (page * 8,),
                 )
                 buttons = [
@@ -1163,10 +1233,30 @@ class Interface:
                 ]
             buttons = grid([b for group in buttons for b in group])
             self.pagination(buttons, user, action, data, page, len(records) > 8)
-            text = "📣 Выберите рассылку" if action == "account_campaign" else "👥 Свободные аккаунты\nПары собираются автоматически."
+            text = (
+                "📣 Выберите рассылку"
+                if action == "account_campaign"
+                else "👥 Свободные аккаунты\nПары собираются автоматически."
+            )
             if not records:
-                text += "\n\n" + ("На этой странице ничего нет." if page else "Список пуст — сначала добавьте " + ("рассылку." if action == "account_campaign" else "аккаунт."))
-                buttons.append([await self.e.db.run(self.button, user, "➕ Добавить", "add", {"section": "campaigns" if action == "account_campaign" else "accounts"}, True)])
+                text += "\n\n" + (
+                    "На этой странице ничего нет."
+                    if page
+                    else "Список пуст — сначала добавьте "
+                    + ("рассылку." if action == "account_campaign" else "аккаунт.")
+                )
+                buttons.append(
+                    [
+                        await self.e.db.run(
+                            self.button,
+                            user,
+                            "➕ Добавить",
+                            "add",
+                            {"section": "campaigns" if action == "account_campaign" else "accounts"},
+                            True,
+                        )
+                    ]
+                )
             return View(
                 text,
                 buttons + await self.e.db.run(self.nav, user, "accounts"),
@@ -1202,14 +1292,15 @@ class Interface:
             self.pagination(buttons, user, "pair_choose", data, page, len(records) > page * 8 + 8)
             return View(
                 ("Выберите B" if data.get("a") else "Выберите A")
-                if records else "Нет подходящих аккаунтов для ручного связывания. Автоматические пары уже учтены.",
+                if records
+                else "Нет подходящих аккаунтов для ручного связывания. Автоматические пары уже учтены.",
                 grid([b for group in buttons for b in group]) + await self.e.db.run(self.nav, user, "pairs"),
             )
         if action == "pair_link":
             pair_id = await self.e.db.run(self.e.link_pair, data["a"], data["b"])
             return await self.e.db.run(self.card, user, "pairs", pair_id)
         if action == "pair_chats":
-            chats = await self.e.db.run(self.e.pair_card, item_id)["chats"]
+            chats = (await self.e.db.run(self.e.pair_card, item_id))["chats"]
             page = data.get("page", 0)
             buttons = [
                 [
@@ -1329,7 +1420,10 @@ class Interface:
                 if target == "list":
                     dest["section"] = "errors" if data.get("return") == "errors" else "stats"
                 buttons.append([await self.e.db.run(self.button, user, title, target, dest)])
-            return View("📅 Выберите период", grid([b for group in buttons for b in group]) + await self.e.db.run(self.nav, user))
+            return View(
+                "📅 Выберите период",
+                grid([b for group in buttons for b in group]) + await self.e.db.run(self.nav, user),
+            )
         if action == "entity_errors":
             return await self.e.db.run(
                 self.errors, user, data.get("period", "all"), data.get("page", 0), section, item_id
@@ -1460,9 +1554,17 @@ class Interface:
                 await self.e.db.run(self.e.set_setting, field, text.strip())
                 result = (
                     await self.e.db.run(self.queue_settings, user)
-                    if field in RUNTIME_LIMITS else await self.e.db.run(self.listing, user, "settings")
+                    if field in RUNTIME_LIMITS
+                    else await self.e.db.run(self.listing, user, "settings")
                 )
-            elif field in {"campaign_name", "interval", "limit", "reply_cooldown", "dm_greeting_phrase", "dm_sticker_emoji"}:
+            elif field in {
+                "campaign_name",
+                "interval",
+                "limit",
+                "reply_cooldown",
+                "dm_greeting_phrase",
+                "dm_sticker_emoji",
+            }:
                 key = {
                     "campaign_name": "name",
                     "interval": "interval_seconds",
@@ -1472,8 +1574,13 @@ class Interface:
                     "dm_sticker_emoji": "dm_sticker_emoji",
                 }[field]
                 await self.e.db.run(
-                    self.e.edit_campaign, item_id,
-                    **{key: text.strip() if field in {"campaign_name", "dm_greeting_phrase", "dm_sticker_emoji"} else int(text)}
+                    self.e.edit_campaign,
+                    item_id,
+                    **{
+                        key: text.strip()
+                        if field in {"campaign_name", "dm_greeting_phrase", "dm_sticker_emoji"}
+                        else int(text)
+                    },
                 )
                 result = (
                     await self.e.db.run(self.templates_hub, user, item_id, "auto")
@@ -1568,7 +1675,8 @@ class Interface:
             if choices:
                 return View(
                     "Шаг 4 из 4\nВыберите рассылку для нового аккаунта. Подготовка уже началась автоматически.",
-                    grid([
+                    grid(
+                        [
                             await self.e.db.run(
                                 self.button,
                                 user,
@@ -1577,8 +1685,9 @@ class Interface:
                                 {"id": account_id, "campaign_id": r["id"]},
                                 True,
                             )
-                        for r in choices
-                    ])
+                            for r in choices
+                        ]
+                    )
                     + await self.e.db.run(self.nav, user, "accounts"),
                 )
             view = await self.e.db.run(self.card, user, "accounts", account_id)

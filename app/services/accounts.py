@@ -12,6 +12,8 @@ class Accounts:
             candidates = rows(c, "SELECT id,name FROM campaigns WHERE status<>'REMOVED' ORDER BY id")
             if campaign_id is None and len(candidates) == 1:
                 campaign_id = candidates[0]["id"]
+            if telegram_id is not None and row(c, "SELECT id FROM accounts WHERE telegram_id=?", (telegram_id,)):
+                raise DomainError("Этот Telegram-аккаунт уже добавлен")
             account_id = c.execute(
                 "INSERT INTO accounts(name,phone_mask,telegram_id,onboarding_started_at,stage_started_at,"
                 "account_health,created_at) VALUES (?,?,?,?,?,?,?)",
@@ -93,6 +95,7 @@ class Accounts:
                     )
                     c.execute("UPDATE chat_pool SET status='FREE' WHERE id=?", (pc["chat_pool_id"],))
                 c.execute("UPDATE pairs SET account_a_id=NULL WHERE id=?", (pair["id"],))
+        self._cancel_account_dm_sequences(c, account_id)
         c.execute("DELETE FROM campaign_members WHERE account_id=?", (account_id,))
 
     def update_account(self, account_id, action, value=None):
@@ -121,7 +124,9 @@ class Accounts:
                     )
                     if action == "remove":
                         c.execute("DELETE FROM account_sessions WHERE account_id=?", (account_id,))
-                        c.execute("UPDATE accounts SET membership_status='REMOVED' WHERE id=?", (account_id,))
+                        c.execute(
+                            "UPDATE accounts SET membership_status='REMOVED',telegram_id=NULL WHERE id=?", (account_id,)
+                        )
                 c.execute(
                     "UPDATE dispatch_jobs SET status='CANCELLED' WHERE account_id=? AND status='PENDING'", (account_id,)
                 )
@@ -185,12 +190,35 @@ class Accounts:
             if not account:
                 return
             failures = account["connection_failures"] + 1
-            delay = min(self.config.retry_max, self.config.retry_base * 2 ** min(failures - 1, 10))
+            options = self.runtime_options()
+            delay = min(options["retry_max"], options["retry_base"] * 2 ** min(failures - 1, 10))
             c.execute(
                 "UPDATE accounts SET connection_failures=?,connection_retry_at=? WHERE id=?",
                 (failures, self.clock() + delay, account_id),
             )
             self.audit(c, "CONNECTION_RETRY", account_id=account_id, retry=failures, delay=delay)
+
+    def connection_succeeded(self, account_id):
+        # A connection only resets network backoff; it cannot clear moderation restrictions or pauses.
+        with self.db.tx() as c:
+            c.execute(
+                "UPDATE accounts SET connection_failures=0,connection_retry_at=0 WHERE id=? "
+                "AND (connection_failures<>0 OR connection_retry_at<>0)",
+                (account_id,),
+            )
+
+    def _flood_wait(self, c, account_id, seconds):
+        c.execute(
+            "UPDATE accounts SET flood_until=MAX(flood_until,?),last_error='FLOOD_WAIT' WHERE id=?",
+            (self.clock() + max(1, seconds), account_id),
+        )
+        pair = row(c, "SELECT * FROM pairs WHERE account_a_id=? OR account_b_id=?", (account_id, account_id))
+        if pair:
+            self._pause_clock(c, pair)
+
+    def flood_wait(self, account_id, seconds):
+        with self.db.tx() as c:
+            self._flood_wait(c, account_id, seconds)
 
     def connection_verified(self, account_id):
         with self.db.tx() as c:

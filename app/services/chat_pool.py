@@ -119,10 +119,16 @@ class ChatPool:
 
     def set_chat_permissions(self, chat_id, approved, join_allowed=False, greeting_allowed=False, split_allowed=False):
         with self.db.tx() as c:
+            previous = row(c, "SELECT join_allowed FROM chat_pool WHERE id=?", (chat_id,))
             c.execute(
                 "UPDATE chat_pool SET approved=?,join_allowed=?,greeting_allowed=?,split_allowed=? WHERE id=?",
                 (approved, join_allowed, greeting_allowed, split_allowed, chat_id),
             )
+            if previous and bool(previous["join_allowed"]) != bool(join_allowed):
+                c.execute(
+                    "UPDATE dispatch_jobs SET status='CANCELLED' WHERE chat_pool_id=? AND kind='JOIN' AND status='PENDING'",
+                    (chat_id,),
+                )
             if not approved:
                 c.execute(
                     "UPDATE pair_chats SET status='PAUSED_NEEDS_REVIEW' WHERE chat_pool_id=? AND removed_at IS NULL",
@@ -247,7 +253,11 @@ class ChatPool:
                 "UPDATE pair_chats SET status='ASSIGNED',last_error=NULL WHERE chat_pool_id=? AND removed_at IS NULL",
                 (chat_id,),
             )
-            c.execute("UPDATE account_chat_access SET manual_required=0 WHERE chat_pool_id=?", (chat_id,))
+            c.execute(
+                "UPDATE account_chat_access SET manual_required=0,verification_generation=verification_generation+1 "
+                "WHERE chat_pool_id=?",
+                (chat_id,),
+            )
             c.execute("DELETE FROM chat_failures WHERE chat_pool_id=?", (chat_id,))
             c.execute(
                 "UPDATE dispatch_jobs SET status='CANCELLED' WHERE chat_pool_id=? AND status='FAILED' AND kind='JOIN'",

@@ -55,9 +55,14 @@ async def update_view(bot, message, view):
             reason = exc.message.lower()
             if "message is not modified" in reason:
                 return message
-            if not any(part in reason for part in (
-                "message can't be edited", "message can not be edited", "message to edit not found",
-            )):
+            if not any(
+                part in reason
+                for part in (
+                    "message can't be edited",
+                    "message can not be edited",
+                    "message to edit not found",
+                )
+            ):
                 raise
     return await send_view(bot, message.chat.id, view)
 
@@ -106,7 +111,9 @@ def make_dispatcher(ui):
             try:
                 view = await ui.callback(query.from_user.id, query.data or "")
             except (DomainError, ValueError, PermissionError) as exc:
-                text = str(exc)[:180] if isinstance(exc, (DomainError, PermissionError)) else "Проверьте введённые данные"
+                text = (
+                    str(exc)[:180] if isinstance(exc, (DomainError, PermissionError)) else "Проверьте введённые данные"
+                )
                 view = View(text, await ui.e.db.run(ui.nav, query.from_user.id))
             await update_view(query.bot, query.message, view)
         except Exception as exc:
@@ -237,6 +244,18 @@ class BotNotificationSink:
             view = View(
                 f"⚠️ Рассылка №{payload['campaign_id']} приостановлена\nПричина: {label(payload['reason'])}\nИсправьте шаблон / медиа и возобновите рассылку.",
                 [[ui.button(admin_id, "📣 Рассылка", "card", {"id": payload["campaign_id"], "section": "campaigns"})]],
+            )
+        elif kind == "reply_failed":
+            view = View(
+                f"⚠️ Ответ в ЛС не отправлен\nАккаунт №{payload['account_id']} · Собеседник {payload['peer_id']}\n"
+                f"Причина: {label(payload['reason'])}\n"
+                + (
+                    "Рассылка приостановлена. "
+                    if payload.get("campaign_paused")
+                    else "Ошибка этого ЛС не блокирует пару. "
+                )
+                + "Подтверждённые части приветствия сохранены.",
+                [[ui.button(admin_id, "🔎 Аккаунт", "card", {"id": payload["account_id"], "section": "accounts"})]],
             )
         elif kind == "overload":
             view = View(

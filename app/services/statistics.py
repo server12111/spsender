@@ -95,7 +95,8 @@ class Statistics:
                 }
             scopes = {
                 "accounts": " WHERE account_health<>'REMOVED'",
-                "pairs": " WHERE account_a_id IS NOT NULL",
+                "pairs": " WHERE account_a_id IS NOT NULL AND EXISTS(SELECT 1 FROM campaigns ca "
+                "WHERE ca.id=pairs.campaign_id AND ca.status<>'REMOVED')",
                 "campaigns": " WHERE status<>'REMOVED'",
                 "chat_pool": "",
             }

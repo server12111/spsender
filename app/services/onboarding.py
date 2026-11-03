@@ -78,7 +78,7 @@ class Onboarding:
                         "INSERT OR IGNORE INTO account_chat_access(account_id,chat_pool_id) VALUES (?,?)",
                         (account["id"], chat["chat_pool_id"]),
                     )
-                    access = {"joined": 0, "can_write": 0, "manual_required": 0}
+                    access = {"joined": 0, "can_write": 0, "manual_required": 0, "verification_generation": 0}
                     access_map[(account["id"], chat["chat_pool_id"])] = access
                 if not access["joined"] or not access["can_write"]:
                     incomplete.append((chat, access))
@@ -111,7 +111,7 @@ class Onboarding:
                         chat["chat_pool_id"],
                         account["id"],
                         {"peer_id": chat["chat_id"], "link": chat["link"], "join_allowed": bool(chat["join_allowed"])},
-                        f"join:{account['id']}:{chat['chat_pool_id']}",
+                        f"join:{account['id']}:{chat['chat_pool_id']}:pair:{pair['id']}:check:{access['verification_generation']}",
                     )
                     break
                 continue

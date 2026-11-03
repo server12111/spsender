@@ -8,7 +8,7 @@ class Autoresponders:
         with self.db.tx() as c:
             self.campaign(c, campaign_id)
             c.execute(
-                "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE campaign_id=? AND status='ACTIVE' "
+                "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE campaign_id=? AND status IN ('ACTIVE','FAILED') "
                 "AND (current_job_id IS NULL OR current_job_id IN (SELECT id FROM dispatch_jobs WHERE status IN ('FAILED','CANCELLED','CONFIRMED')))",
                 (campaign_id,),
             )
@@ -85,8 +85,24 @@ class Autoresponders:
                         "at": self.clock(),
                     },
                 )
-            if private and row(c, "SELECT 1 FROM dm_reply_sequences WHERE campaign_id=? AND peer_id=? AND status='ACTIVE'", (campaign["id"], peer_id)):
+            if private and row(
+                c,
+                "SELECT 1 FROM dm_reply_sequences WHERE campaign_id=? AND peer_id=? AND status='ACTIVE'",
+                (campaign["id"], peer_id),
+            ):
                 return []
+            if private:
+                failed = row(
+                    c,
+                    "SELECT * FROM dm_reply_sequences WHERE campaign_id=? AND pair_id=? AND account_id=? "
+                    "AND peer_id=? AND status='FAILED' ORDER BY id DESC LIMIT 1",
+                    (campaign["id"], pair["id"], account_id, peer_id),
+                )
+                if failed and self._reactivate_dm_sequence(c, failed):
+                    c.execute("UPDATE dm_reply_sequences SET reply_to=? WHERE id=?", (message_id, failed["id"]))
+                    failed = row(c, "SELECT * FROM dm_reply_sequences WHERE id=?", (failed["id"],))
+                    job_id = self._queue_dm_step(c, failed, pair, campaign)
+                    return [job_id] if job_id is not None else []
             kinds = ("dm_first", "dm_always") if private else ("group",)
             jobs = []
             dm_steps = []
@@ -126,17 +142,35 @@ class Autoresponders:
                 }
                 if private:
                     if kind == "dm_first":
-                        dm_steps.extend([
-                            {"role": "sticker", "history_kind": kind, "history_complete": False,
-                             "body": {"sticker_emoji": campaign["dm_sticker_emoji"], "text": "", "media_path": None}},
-                            {"role": "phrase", "history_kind": kind, "history_complete": False,
-                             "body": {"text": campaign["dm_greeting_phrase"], "media_path": None}},
-                        ])
-                    dm_steps.append({
-                        "role": "text", "history_kind": kind, "history_complete": True,
-                        "template_position": template["position"],
-                        "body": {key: template[key] for key in ("text", "media_path", "media_kind")},
-                    })
+                        dm_steps.extend(
+                            [
+                                {
+                                    "role": "sticker",
+                                    "history_kind": kind,
+                                    "history_complete": False,
+                                    "body": {
+                                        "sticker_emoji": campaign["dm_sticker_emoji"],
+                                        "text": "",
+                                        "media_path": None,
+                                    },
+                                },
+                                {
+                                    "role": "phrase",
+                                    "history_kind": kind,
+                                    "history_complete": False,
+                                    "body": {"text": campaign["dm_greeting_phrase"], "media_path": None},
+                                },
+                            ]
+                        )
+                    dm_steps.append(
+                        {
+                            "role": "text",
+                            "history_kind": kind,
+                            "history_complete": True,
+                            "template_position": template["position"],
+                            "body": {key: template[key] for key in ("text", "media_path", "media_kind")},
+                        }
+                    )
                     continue
                 job_id = self._enqueue(
                     c,
