@@ -18,6 +18,7 @@ from app.services.chat_pool import parse_target
 from app.services.memberships import CHALLENGE, membership_links, membership_prompt
 
 from .base import OperationError, Result
+from .limits import RPCBudget
 from .session import BoundedStringSession
 
 MANUAL_VERIFICATION = re.compile(
@@ -26,6 +27,8 @@ MANUAL_VERIFICATION = re.compile(
 
 
 def classify_error(exc):
+    if isinstance(exc, OperationError):
+        return exc
     name = type(exc).__name__
     if isinstance(exc, errors.FloodWaitError):
         return OperationError("flood", "FLOOD_WAIT", max(1, exc.seconds))
@@ -111,6 +114,9 @@ class TelegramTransport:
         self._sync_cursor = 0
         self._closing = False
         self._retiring = set()
+        self._operation_semaphore = RPCBudget(engine)
+        self._operation_locks = WeakValueDictionary()
+        self._chat_operation_locks = WeakValueDictionary()
 
     def new_client(self, session="", updates=True):
         return TelegramClient(
@@ -231,6 +237,9 @@ class TelegramTransport:
         self._incoming_workers = [asyncio.create_task(consume()) for _ in range(2)]
 
     async def _handle_incoming(self, account_id, event):
+        legacy=getattr(self,"legacy_runtime",None)
+        if legacy and event.chat_id in legacy._warmup_chats:
+            return
         try:
             current = await self.engine.db.run(
                 self.engine.db.one,
@@ -325,8 +334,8 @@ class TelegramTransport:
     async def sync_listeners(self):
         eligible = await self.engine.db.run(
             self.engine.db.all,
-            "SELECT a.id,s.encrypted_session FROM accounts a JOIN account_sessions s ON s.account_id=a.id JOIN campaign_members m ON m.account_id=a.id JOIN campaigns ca ON ca.id=m.campaign_id WHERE a.account_health='OK' AND a.paused=0 AND a.onboarding_started_at<=? AND a.flood_until<=? AND a.connection_retry_at<=? AND ca.status='RUNNING' ORDER BY a.id",
-            (self.engine.clock() - 86400, self.engine.clock(), self.engine.clock()),
+            "SELECT a.id,s.encrypted_session FROM accounts a JOIN account_sessions s ON s.account_id=a.id LEFT JOIN campaign_members m ON m.account_id=a.id LEFT JOIN campaigns ca ON ca.id=m.campaign_id LEFT JOIN legacy_warmup_settings w ON w.account_id=a.id WHERE a.account_health='OK' AND a.paused=0 AND a.onboarding_started_at<=? AND a.flood_until<=? AND a.connection_retry_at<=? AND (ca.status='RUNNING' OR (?=1 AND m.account_id IS NULL AND w.enabled=1)) ORDER BY a.id",
+            (self.engine.clock() - 86400, self.engine.clock(), self.engine.clock(),bool(getattr(self.engine,"legacy_runtime_active",False))),
         )
         ids = {a["id"] for a in eligible}
         retiring = sorted(account_id for account_id in self.clients if account_id not in ids)
@@ -378,6 +387,17 @@ class TelegramTransport:
         await asyncio.gather(*(connect(a) for a in chosen))
 
     async def execute(self, job):
+        if hasattr(self, "_operation_semaphore"):
+            lock = self._operation_locks.setdefault(job["account_id"], asyncio.Lock())
+            async with self._operation_semaphore, lock:
+                if job.get("chat_pool_id") is not None:
+                    chat_lock = self._chat_operation_locks.setdefault(job["chat_pool_id"], asyncio.Lock())
+                    async with chat_lock:
+                        return await self._execute_bounded(job)
+                return await self._execute_bounded(job)
+        return await self._execute_bounded(job)
+
+    async def _execute_bounded(self, job):
         try:
             return await asyncio.wait_for(self._execute(job), timeout=120)
         except OperationError:
@@ -704,6 +724,67 @@ class AccountAuthorizer:
         self._locks = {admin: asyncio.Lock() for admin in engine.config.admin_ids}
 
     @auth_serialized
+    async def import_file(self, admin_id, filename, content):
+        import tempfile
+
+        from app.legacy.session_import import detect_import_kind, load_import_source, sqlite_session_kind
+
+        if self.engine.config.mode != "live":
+            raise ValueError("Импорт настоящих сессий доступен только в live")
+        if len(content) > 20 * 1024 * 1024:
+            raise ValueError("Файл слишком большой")
+        kind = detect_import_kind(filename, content[:16])
+        if not kind:
+            raise ValueError("Нужен .session или ZIP с tdata")
+        await self._cancel(admin_id)
+        directory = tempfile.TemporaryDirectory(prefix="fe-account-import-")
+        path = Path(directory.name) / ("source.zip" if kind == "tdata" else "source.session")
+        path.write_bytes(content)
+        self.pending[admin_id] = {"directory": directory, "at": self.engine.clock(), "import": True}
+        try:
+            if kind == "session":
+                kind = await asyncio.to_thread(sqlite_session_kind, str(path))
+            source = await asyncio.wait_for(load_import_source(kind, str(path), directory.name), 90)
+            self.pending[admin_id]["source"] = source
+            return await self._finish_import(admin_id)
+        except BaseException:
+            await self._cancel(admin_id)
+            raise
+
+    @auth_serialized
+    async def finish_import(self, admin_id, password):
+        pending = self.pending.get(admin_id)
+        if not pending or not pending.get("import") or self.engine.clock() - pending["at"] > 600:
+            await self._cancel(admin_id)
+            raise ValueError("Импорт истёк. Начните заново")
+        return await self._finish_import(admin_id, password)
+
+    async def _finish_import(self, admin_id, password=None):
+        from opentele.api import APIData
+
+        from app.legacy.session_import import ImportPasswordRequired, create_new_session
+
+        pending = self.pending[admin_id]
+        try:
+            client = await asyncio.wait_for(
+                create_new_session(
+                    pending["source"],
+                    APIData(api_id=self.engine.config.api_id, api_hash=self.engine.config.api_hash),
+                    password=password,
+                ),
+                90,
+            )
+        except ImportPasswordRequired:
+            return None
+        pending["client"] = client
+        me = await asyncio.wait_for(client.get_me(), 30)
+        if not me or getattr(me, "bot", False) or not getattr(me, "phone", None):
+            raise ValueError("Сессия должна принадлежать вашему пользовательскому аккаунту")
+        result = ("+" + me.phone.lstrip("+"), client.session.save(), me.id)
+        await self._cancel(admin_id)
+        return result
+
+    @auth_serialized
     async def begin(self, admin_id, phone):
         self.engine.authorize(admin_id)
         await self._cancel(admin_id)
@@ -760,6 +841,15 @@ class AccountAuthorizer:
         pending = self.pending.pop(admin_id, None)
         if pending and "client" in pending:
             await asyncio.wait_for(pending["client"].disconnect(), 10)
+        if pending and "source" in pending:
+            from app.legacy.session_import import cleanup_import_source
+
+            await asyncio.wait_for(cleanup_import_source(pending["source"]), 10)
+        if pending and "directory" in pending:
+            import tempfile
+            if not Path(pending["directory"].name).resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
+                raise ValueError("Небезопасный путь временного импорта")
+            await asyncio.to_thread(pending["directory"].cleanup)
 
     async def expire(self):
         for admin_id in list(self.pending):

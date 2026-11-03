@@ -6,6 +6,7 @@ from .core import Core, DomainError
 from .dispatch import Dispatch
 from .dm_sequences import DMSequences
 from .greetings import Greetings
+from .legacy_features import LegacyFeatures
 from .memberships import Memberships
 from .notifications import Notifications
 from .onboarding import Onboarding
@@ -27,6 +28,7 @@ class Engine(
     DMSequences,
     Rotation,
     Memberships,
+    LegacyFeatures,
     Statistics,
     Core,
 ):

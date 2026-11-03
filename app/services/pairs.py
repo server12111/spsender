@@ -25,6 +25,12 @@ class Pairs:
         return [row(c, "SELECT * FROM accounts WHERE id=?", (pair[key],)) for key in ("account_a_id", "account_b_id")]
 
     def _pair_ready(self, c, pair):
+        if row(
+            c,
+            "SELECT 1 FROM legacy_rpc_journal WHERE account_id IN (?,?) AND status='UNKNOWN' LIMIT 1",
+            (pair["account_a_id"], pair["account_b_id"]),
+        ):
+            return False
         if self._rotation_pair_blocked(c, pair["id"]):
             return False
         if row(c, "SELECT 1 FROM dispatch_jobs WHERE pair_id=? AND status='UNKNOWN'", (pair["id"],)):

@@ -68,6 +68,12 @@ class Rotation:
         )
 
     def _rotation_accounts_ready(self, c, pair):
+        if row(
+            c,
+            "SELECT 1 FROM legacy_rpc_journal WHERE status='UNKNOWN' AND account_id IN (?,?) LIMIT 1",
+            (pair["account_a_id"], pair["account_b_id"]),
+        ):
+            return False
         return not row(
             c, "SELECT 1 FROM dispatch_jobs WHERE pair_id=? AND status='UNKNOWN' LIMIT 1", (pair["id"],)
         ) and all(
@@ -302,7 +308,12 @@ class Rotation:
                         "UPDATE dispatch_jobs SET status='CANCELLED' WHERE pair_id=? AND status='PENDING'", (pair_id,)
                     )
                     self._cancel_group_replies(c, pair_id=pair_id)
-            if not row(
+            native_busy = row(
+                c,
+                "SELECT 1 FROM legacy_rpc_journal WHERE status IN ('INFLIGHT','UNKNOWN') AND account_id IN (?,?,?,?) LIMIT 1",
+                (exchange["left_a"], exchange["left_b"], exchange["right_a"], exchange["right_b"]),
+            )
+            if not native_busy and not row(
                 c,
                 "SELECT 1 FROM dispatch_jobs WHERE pair_id IN (?,?) AND status IN ('INFLIGHT','UNKNOWN') LIMIT 1",
                 (exchange["left_pair_id"], exchange["right_pair_id"]),
@@ -345,7 +356,7 @@ class Rotation:
     def _apply_exchange(self, c, exchange, campaign):
         targets = rows(
             c,
-            "SELECT t.*,pc.cooldown_until,pc.last_sent_at FROM rotation_targets t JOIN pair_chats pc "
+            "SELECT t.*,pc.cooldown_until,pc.last_sent_at,pc.interval_seconds,pc.message_cursor,pc.delivery_seq,pc.legacy_options FROM rotation_targets t JOIN pair_chats pc "
             "ON pc.id=t.assignment_id WHERE t.exchange_id=? ORDER BY t.id",
             (exchange["id"],),
         )
@@ -363,8 +374,18 @@ class Rotation:
         for target in targets:
             cooldown = max(pair_cooldowns[target["pair_id"]], target["cooldown_until"])
             c.execute(
-                "INSERT INTO pair_chats(pair_id,chat_pool_id,assigned_at,last_sent_at,cooldown_until) VALUES (?,?,?,?,?)",
-                (target["pair_id"], target["chat_pool_id"], self.clock(), target["last_sent_at"], cooldown),
+                "INSERT INTO pair_chats(pair_id,chat_pool_id,assigned_at,last_sent_at,cooldown_until,interval_seconds,message_cursor,delivery_seq,legacy_options) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    target["pair_id"],
+                    target["chat_pool_id"],
+                    self.clock(),
+                    target["last_sent_at"],
+                    cooldown,
+                    target["interval_seconds"],
+                    target["message_cursor"],
+                    target["delivery_seq"],
+                    target["legacy_options"],
+                ),
             )
         c.execute(
             "UPDATE rotation_exchanges SET status='APPLIED',applied_at=? WHERE id=?", (self.clock(), exchange["id"])

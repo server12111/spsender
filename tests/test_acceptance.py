@@ -188,7 +188,8 @@ async def test_10_pause_does_not_advance_or_reset_days(env):
 async def test_11_campaign_wide_templates_and_versioning(env):
     e, _, api, _ = env
     ca, pair, a, b, chats = setup_pair(e, 1)
-    e.edit_campaign(ca, "group", ["Группа новая"], group_reply_enabled=True)
+    with pytest.raises(ValueError, match="только в ЛС"):
+        e.edit_campaign(ca, "group", ["Группа новая"], group_reply_enabled=True)
     e.edit_campaign(ca, "dm_always", ["ЛС новое"], dm_always_enabled=True)
     e.edit_campaign(ca, "mailing", ["Новая рассылка"])
     assert len(e.templates(ca, "mailing")) == 1
@@ -205,7 +206,7 @@ async def test_11_campaign_wide_templates_and_versioning(env):
             "SELECT count(*) FROM campaign_templates WHERE campaign_id=? AND kind='group' AND version=(SELECT version FROM campaigns WHERE id=?)",
             (ca, ca),
         )
-        == 1
+        == 0
     )
 
 
@@ -419,7 +420,7 @@ def test_27_migrations_and_packaged_smoke(env):
     e.db.migrate()
     assert e.db.scalar("PRAGMA integrity_check") == "ok"
     assert not e.db.all("PRAGMA foreign_key_check")
-    assert e.db.scalar("SELECT count(*) FROM schema_migrations") == 9
+    assert e.db.scalar("SELECT count(*) FROM schema_migrations") == 10
     from app.__main__ import smoke
 
     asyncio.run(smoke())

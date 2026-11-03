@@ -119,7 +119,6 @@ async def test_long_join_stage_keeps_minimum_pause_and_delays_readiness(env):
 async def test_autoreplies_filter_bots_own_and_non_reply_group_messages(env):
     e, clock, api, _ = env
     ca, pair, a, b, chats = setup_pair(e, 1)
-    e.edit_campaign(ca, "group", ["Ответ группы"], group_reply_enabled=True)
     e.edit_campaign(ca, "dm_first", ["Первый ответ"], dm_first_enabled=True)
     e.edit_campaign(ca, "dm_always", ["Каждый ответ"], dm_always_enabled=True)
     active = e.pair_card(pair)["active_account_id"]
@@ -129,7 +128,7 @@ async def test_autoreplies_filter_bots_own_and_non_reply_group_messages(env):
     assert not e.incoming(active, 500, 3, 500, True, outgoing=True)
     assert not e.incoming(active, -100000, 4, 500, False)
     assert not e.incoming(active, -100000, 5, 500, False, reply_to_sender_id=999)
-    assert e.incoming(active, -100000, 6, 500, False, reply_to_sender_id=me)
+    assert not e.incoming(active, -100000, 6, 500, False, reply_to_sender_id=me)
     assert len(e.incoming(active, 500, 7, 500, True)) == 1
     for _ in range(4):
         await drain(e, api)

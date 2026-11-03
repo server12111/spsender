@@ -28,10 +28,12 @@ def incoming_group(e, pair, message_id=1):
 
 def full_group_queue(e):
     campaign, pair, a, b, chats = setup_pair(e, 1)
-    e.edit_campaign(campaign, "group", ["Group reply"], group_reply_enabled=True)
     e.set_setting("max_pending_jobs", 1)
     e.tick()
     assert not incoming_group(e, pair)
+    with e.db.tx() as c:
+        c.execute("INSERT INTO group_reply_intents(campaign_id,pair_id,account_id,chat_pool_id,peer_id,payload,version,idempotency_key,created_at) "
+                  "VALUES (?,?,?,?,?,'{}',1,'legacy-group',?)", (campaign,pair,a,chats[0],-100000,e.clock()))
     return campaign, pair, a, b, chats
 
 
@@ -81,21 +83,16 @@ def test_invalid_manual_reply_never_reaches_account_queue(env, template):
     assert not e.db.scalar("SELECT count(*) FROM dispatch_jobs")
 
 
-async def test_full_queue_group_reply_is_durable_and_deduplicated(env):
+async def test_retired_group_reply_is_cancelled_after_restart_with_full_queue(env):
     e, _, api, _ = env
     _, pair, _, _, _ = full_group_queue(e)
     assert not incoming_group(e, pair, 2)
-    assert e.db.scalar("SELECT count(*) FROM group_reply_intents WHERE status='WAITING'") == 1
     assert await e.run_one(api)
     e = restart(e)
     e.tick()
-    assert await e.run_one(api)
-    assert api.calls[-1]["kind"] == "GROUP_REPLY"
-    assert api.calls[-1]["payload"]["reply_to"] == 1
-    assert e.db.scalar("SELECT status FROM group_reply_intents") == "QUEUED"
-    e.tick()
-    assert not await e.run_one(api)
-    assert sum(j["kind"] == "GROUP_REPLY" for j in api.calls) == 1
+    assert e.db.scalar("SELECT status FROM group_reply_intents") == "CANCELLED"
+    await e.run_one(api)
+    assert all(job["kind"] != "GROUP_REPLY" for job in api.calls)
 
 
 @pytest.mark.parametrize("change", ["PAUSED", "STOPPED", "REMOVED", "edit", "account_pause", "archive", "critical"])
@@ -105,7 +102,7 @@ def test_stopping_or_changing_context_cancels_waiting_group_reply(env, change):
     if change in {"PAUSED", "STOPPED", "REMOVED"}:
         e.campaign_status(campaign, change, confirmed=True)
     elif change == "edit":
-        e.edit_campaign(campaign, "group", ["New reply"])
+        e.edit_campaign(campaign, "dm_always", ["New reply"])
     elif change == "account_pause":
         e.update_account(a, "pause")
     elif change == "archive":
@@ -421,7 +418,6 @@ async def test_mixed_state_transitions_preserve_delivery_and_queue_invariants(en
     for kind, flag in (
         ("dm_first", "dm_first_enabled"),
         ("dm_always", "dm_always_enabled"),
-        ("group", "group_reply_enabled"),
     ):
         e.edit_campaign(campaign, kind, ["Reply"], **{flag: True})
     e.set_setting("max_pending_jobs", 3)

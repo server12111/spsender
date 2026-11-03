@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fe-autosender"
-version = "2.1.0"
+version = "2.2.0"
 description = "Личная Telegram-админка разрешённых публикаций"
 requires-python = ">=3.11"
-dependencies = ["aiogram>=3.31,<3.32", "Telethon>=1.45,<1.46", "cryptography>=44", "python-dotenv>=1.0", "tzdata>=2025.1"]
+dependencies = ["aiogram>=3.31,<3.32", "Telethon>=1.45,<1.46", "cryptography>=44", "python-dotenv>=1.0", "tzdata>=2025.1", "Pillow>=10", "pytz>=2024.1", "opentele-ng[pyrogram]>=1.4.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.25", "pytest-socket>=0.7", "ruff>=0.11"]
@@ -33,4 +33,10 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/legacy/services.py" = ["E402", "E731", "I"]
+"app/legacy/original_mailing.py" = ["E741"]
+"app/legacy/warmup_*.py" = ["I"]
+"app/legacy/utils/time_utils.py" = ["E402"]
 

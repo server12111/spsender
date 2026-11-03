@@ -275,6 +275,8 @@ class Interface:
             )
         if section == "pairs":
             buttons.append([self.button(user, "⚙️ Настройка пар", "pair_tools")])
+        if section == "accounts":
+            buttons.append([self.button(user, "📁 .session / tdata", "account_import", once=True)])
         buttons.append(
             [
                 self.button(user, "🔎 Поиск", "search", {"section": section}),
@@ -379,11 +381,84 @@ class Interface:
         self.pagination(buttons, user, "list", {"section": "preparation"}, page, len(accounts) > 8)
         buttons += [
             [
+                self.button(user, "🤝 Пул прогрева", "warmup_pool"),
+                self.button(user, "🔥 Каналы прогрева", "warmup_channels"),
+            ],
+            [
                 self.button(user, "💬 Пул чатов", "list", {"section": "chats"}),
                 self.button(user, "👋 Приветствия", "list", {"section": "greetings"}),
-            ]
+            ],
         ]
         return View(text, buttons + self.nav(user))
+
+    def warmup_pool_view(self, user, page=0):
+        self.e.authorize(user)
+        accounts = self.e.warmup_pool(page)
+        text = "🤝 Пул прогрева\n\nВыбери свои подключённые аккаунты, которые будут собеседниками. Остальные аккаунты прогреваются автоматически и могут общаться друг с другом.\n"
+        buttons = []
+        for account in accounts[:8]:
+            buttons.append(
+                [
+                    self.button(
+                        user,
+                        ("✅ " if account["selected"] else "➕ ") + account["name"][:28],
+                        "warmup_partner",
+                        {
+                            "id": account["id"],
+                            "enabled": not account["selected"],
+                            "expected": bool(account["selected"]),
+                            "page": page,
+                        },
+                        True,
+                    )
+                ]
+            )
+        self.pagination(buttons, user, "warmup_pool", {}, page, len(accounts) > 8)
+        buttons.append([self.button(user, "◀️ Подготовка", "list", {"section": "preparation"})])
+        return View(text if accounts else text + "Добавьте аккаунты в бота.", buttons)
+
+    def warmup_channels_view(self, user, page=0):
+        self.e.authorize(user)
+        channels = self.e.db.all("SELECT * FROM warmup_channels ORDER BY id LIMIT 9 OFFSET ?", (max(0, page) * 8,))
+        text = "🔥 Каналы прогрева\n\nОтдельный пул каналов для старого механизма прогрева. Заполни его своими разрешёнными целями.\n"
+        buttons = [[self.button(user, "➕ Добавить", "warmup_channels_add", once=True)]]
+        for channel in channels[:8]:
+            text += "\n" + channel["username"]
+            buttons.append(
+                [
+                    self.button(
+                        user, "🗑 " + channel["username"][:35], "warmup_channel_remove", {"id": channel["id"]}, True
+                    )
+                ]
+            )
+        self.pagination(buttons, user, "warmup_channels", {}, page, len(channels) > 8)
+        buttons.append([self.button(user, "◀️ Подготовка", "list", {"section": "preparation"})])
+        return View(text[:3900], buttons)
+
+    def legacy_unknown_view(self, user):
+        self.e.authorize(user)
+        records = self.e.db.all(
+            "SELECT id,account_id,method FROM legacy_rpc_journal WHERE status='UNKNOWN' ORDER BY id LIMIT 8"
+        )
+        text = "❓ Сверка операций прогрева\nПроверь историю Telegram перед решением. Операция автоматически не повторяется.\n"
+        buttons = []
+        for item in records:
+            text += f"\n№{item['id']} · аккаунт №{item['account_id']} · {item['method']}"
+            buttons.append(
+                [
+                    self.button(
+                        user, f"№{item['id']} выполнена", "legacy_resolve", {"id": item["id"], "performed": True}, True
+                    ),
+                    self.button(
+                        user,
+                        f"№{item['id']} не выполнена",
+                        "legacy_resolve",
+                        {"id": item["id"], "performed": False},
+                        True,
+                    ),
+                ]
+            )
+        return View(text if records else text + "Неопределённых операций нет.", buttons + self.nav(user, "errors"))
 
     def pagination(self, buttons, user, action, data, page, more):
         nav = []
@@ -411,7 +486,7 @@ class Interface:
                 "SELECT count(*) FROM pairs WHERE campaign_id=? AND account_a_id IS NOT NULL", (item_id,)
             )
             text = (
-                f"📣 {r['name']} · №{item_id}\n{label(r['status'])}\n\nПар: {count} · Чатов на пару: {r['chat_limit']}\nИнтервал: {r['interval_seconds']} с"
+                f"📣 {r['name']} · №{item_id}\n{label(r['status'])}\n\nПар: {count} · Чатов на пару: {r['chat_limit']}\nИнтервал в чат: {r['interval_seconds']} с · Между чатами: {r['chat_delay_seconds']} с"
                 + metric
             )
             template_count = self.e.db.scalar(
@@ -422,6 +497,7 @@ class Interface:
                 (item_id,),
             )
             text += f"\nШаблонов: {template_count} · Пауз / остановок: {pauses}"
+            text += f"\nЖдать новых сообщений в чате: {'да' if r['skip_unseen'] else 'нет'}"
             buttons = [
                 [
                     b(
@@ -446,7 +522,8 @@ class Interface:
                 ],
                 [
                     b("✏️ Название", "form", {"field": "campaign_name"}),
-                    b("⏱ Интервал", "form", {"field": "interval"}),
+                    b("⏱ Интервал в чат", "form", {"field": "interval"}),
+                    b("⏳ Между чатами", "form", {"field": "chat_delay"}),
                 ],
                 [
                     b("💬 Чатов на пару", "form", {"field": "limit"}),
@@ -481,6 +558,16 @@ class Interface:
                     ),
                 ],
             ]
+            buttons.append(
+                [
+                    b(
+                        "👁 Ждать новых сообщений: " + ("вкл" if r["skip_unseen"] else "выкл"),
+                        "option",
+                        {"field": "skip_unseen", "value": not r["skip_unseen"], "v": r["version"]},
+                        True,
+                    )
+                ]
+            )
             # Only show the state transition that makes sense on this screen.
             start, pause = buttons[0]
             stop = buttons[1][0]
@@ -597,6 +684,15 @@ class Interface:
             text += f"Право публикации: {'Подтверждено' if r['approved'] else 'Не подтверждено'}\nВступление: {'Разрешено' if r['join_allowed'] else 'Только проверка членства'}\n"
             if assignment:
                 text += f"Пара №{assignment['pair_id']} · Назначен {self.time(assignment['assigned_at'])}\nПоследняя отправка: {self.time(assignment['last_sent_at'])}\nCooldown до {self.time(assignment['cooldown_until'])}\nПоследняя ошибка: {label(assignment['last_error'])}\n"
+                text += (
+                    "Интервал: "
+                    + (
+                        f"{assignment['interval_seconds']} с"
+                        if assignment["interval_seconds"]
+                        else "общий интервал рассылки"
+                    )
+                    + "\n"
+                )
             text += metric
             access_rows = self.e.db.all(
                 "SELECT aca.*,a.name FROM account_chat_access aca JOIN accounts a ON a.id=aca.account_id WHERE aca.chat_pool_id=? ORDER BY a.id",
@@ -611,6 +707,8 @@ class Interface:
                 [b("✏️ Права и правила", "chat_permissions"), b("🗑 Удалить из пула", "confirm", {"do": "archive_chat"})],
                 [b("📜 История решений", "chat_history")],
             ]
+            if assignment:
+                buttons.append([b("⏱ Интервал этого чата", "form", {"field": "chat_interval"})])
         else:
             raise DomainError("Карточка не найдена")
         buttons += [
@@ -680,6 +778,8 @@ class Interface:
             [self.button(user, "📅 Период", "periods", {"return": "errors", "section": section, "id": item_id})],
             [self.button(user, "📬 Уведомления", "outbox"), self.button(user, "🩺 Диагностика", "diagnostics")],
         ]
+        if self.e.db.scalar("SELECT count(*) FROM legacy_rpc_journal WHERE status='UNKNOWN'"):
+            buttons.append([self.button(user, "❓ Сверка прогрева", "legacy_unknown")])
         self.pagination(
             buttons,
             user,
@@ -854,14 +954,12 @@ class Interface:
             {"greeting": "Основные приветствия"}
             if section == "greetings"
             else {
-                "group": "Ответы на reply в группе",
                 "dm_first": "Первое входящее ЛС",
                 "dm_always": "Каждое входящее ЛС",
             }
         )
         options = {
             "greeting": "greeting_enabled",
-            "group": "group_reply_enabled",
             "dm_first": "dm_first_enabled",
             "dm_always": "dm_always_enabled",
         }
@@ -982,7 +1080,7 @@ class Interface:
             1: "Название рассылки",
             2: "Добавьте один или несколько текстов. Можно прикреплять фото, видео и файлы с подписью.",
             3: "Медиа необязательно: отправьте вложение для последнего текста или продолжите.",
-            4: "Интервал повторной отправки в чат, в секундах",
+            4: "Интервал в один чат и пауза между чатами: например 300 / 3 секунд. Минимум 30 / 3.",
             5: "Выберите свободные аккаунты. Пары сформируются автоматически.",
             6: "N — общее число чатов на одну пару",
             7: "Включите нужные функции. Тексты приветствий и ответов доступны в карточке рассылки.",
@@ -1019,7 +1117,6 @@ class Interface:
         if step == 7:
             for flag, title in (
                 ("greeting_enabled", "Приветствия"),
-                ("group_reply_enabled", "Ответы в группах"),
                 ("dm_first_enabled", "Первый ответ в ЛС"),
                 ("dm_always_enabled", "Каждый ответ в ЛС"),
             ):
@@ -1088,6 +1185,33 @@ class Interface:
         action, data = token["action"], json.loads(token["data"])
         await self.e.db.run(self._expect_version, data)
         section, item_id = data.get("section"), data.get("id")
+        if action == "account_import":
+            await self.e.db.run(self.set_state, user, "account_import", {"name": "Импортированный"})
+            return View(
+                "Отправьте собственный .session (Telethon/Pyrogram) или ZIP с tdata. Файл будет удалён после обработки.",
+                await self.e.db.run(self.cancel, user),
+            )
+        if action == "warmup_pool":
+            return await self.e.db.run(self.warmup_pool_view, user, data.get("page", 0))
+        if action == "warmup_partner":
+            await self.e.db.run(self.e.set_warmup_partner, item_id, data["enabled"], data["expected"])
+            return await self.e.db.run(self.warmup_pool_view, user, data.get("page", 0))
+        if action == "warmup_channels":
+            return await self.e.db.run(self.warmup_channels_view, user, data.get("page", 0))
+        if action == "warmup_channels_add":
+            await self.e.db.run(self.set_state, user, "warmup_channels")
+            return View(
+                "Отправьте ссылки на каналы прогрева или @username, по одной на строку.",
+                await self.e.db.run(self.cancel, user),
+            )
+        if action == "warmup_channel_remove":
+            await self.e.db.run(self.e.remove_warmup_channel, item_id)
+            return await self.e.db.run(self.warmup_channels_view, user)
+        if action == "legacy_unknown":
+            return await self.e.db.run(self.legacy_unknown_view, user)
+        if action == "legacy_resolve":
+            await self.e.db.run(self.e.resolve_legacy_unknown, item_id, data["performed"])
+            return await self.e.db.run(self.legacy_unknown_view, user)
         if action == "rotation":
             return await self.e.db.run(self.rotation_view, user, item_id, data.get("page", 0))
         if action == "rotation_detail":
@@ -1167,7 +1291,9 @@ class Interface:
                 "join_pause": "Пауза 50–100 секунд",
                 "campaign_name": "Название рассылки",
                 "account_name": "Название аккаунта",
-                "interval": "Интервал в секундах",
+                "interval": "Интервал повторной отправки в один чат, минимум 30 секунд",
+                "chat_delay": "Пауза между разными чатами, минимум 3 секунды",
+                "chat_interval": "Интервал этого чата: минимум 30 секунд; 0 — общий интервал рассылки",
                 "limit": "N общих чатов на пару",
                 "reply_cooldown": "Cooldown ответов в секундах",
                 "dm_greeting_phrase": "Короткое приветствие для ЛС (до 200 символов)",
@@ -1321,10 +1447,8 @@ class Interface:
                     form["limit"],
                     account_ids=form["accounts"],
                     creation_key=form["_draft_id"],
-                    **{
-                        k: form.get(k, False)
-                        for k in ("greeting_enabled", "group_reply_enabled", "dm_first_enabled", "dm_always_enabled")
-                    },
+                    chat_delay_seconds=form.get("chat_delay", 3),
+                    **{k: form.get(k, False) for k in ("greeting_enabled", "dm_first_enabled", "dm_always_enabled")},
                 )
                 await self.e.db.run(self.clear, user)
                 return await self.e.db.run(self.card, user, "campaigns", campaign_id)
@@ -1666,6 +1790,49 @@ class Interface:
             )
         raise DomainError("Кнопка больше не поддерживается")
 
+    @serialized
+    async def import_account(self, user, filename, content):
+        state = await self.e.db.run(self.state, user)
+        if not state or state["state"] != "account_import":
+            raise DomainError("Сначала откройте импорт аккаунта")
+        result = await self.auth.import_file(user, filename, content)
+        if result is None:
+            await self.e.db.run(self.set_state, user, "account_import_password", state["data"])
+            return View(
+                "Введите пароль 2FA импортируемого аккаунта. Он не сохраняется.", await self.e.db.run(self.cancel, user)
+            )
+        return await self._save_authorized_account(user, result, state["data"])
+
+    async def _save_authorized_account(self, user, result, form):
+        phone, session, telegram_id = result
+        if form.get("account_id"):
+            await self.e.db.run(self.e.save_session, form["account_id"], session, telegram_id)
+            account_id, choices = form["account_id"], []
+        else:
+            account_id, choices = await self.e.db.run(self.e.add_account, form["name"], phone, session, telegram_id)
+        await self.e.db.run(self.clear, user)
+        if choices:
+            return View(
+                "Выберите рассылку для аккаунта. Подготовка уже началась автоматически.",
+                grid(
+                    [
+                        await self.e.db.run(
+                            self.button,
+                            user,
+                            r["name"],
+                            "assign_account",
+                            {"id": account_id, "campaign_id": r["id"]},
+                            True,
+                        )
+                        for r in choices
+                    ]
+                )
+                + await self.e.db.run(self.nav, user, "accounts"),
+            )
+        view = await self.e.db.run(self.card, user, "accounts", account_id)
+        view.text = "✅ Аккаунт сохранён · Подготовка началась\n\n" + view.text
+        return view
+
     async def _import_active(self, user, form):
         state = await self.e.db.run(self.state, user)
         return bool(
@@ -1708,12 +1875,26 @@ class Interface:
         if not state:
             return await self.e.db.run(self.main, user, "Выберите действие кнопкой")
         name, form = state["state"], state["data"]
+        if name == "account_import_password":
+            result = await self.auth.finish_import(user, text)
+            if result is None:
+                return View("Пароль не подошёл. Введите пароль 2FA заново.", await self.e.db.run(self.cancel, user))
+            return await self._save_authorized_account(user, result, form)
+        if name == "warmup_channels":
+            total = await self.e.db.run(self.e.add_warmup_channels, text)
+            await self.e.db.run(self.clear, user, form["_revision"])
+            view = await self.e.db.run(self.warmup_channels_view, user)
+            view.text = f"✅ Добавлено: {total}\n\n" + view.text
+            return view
         if name == "search":
             await self.e.db.run(self.clear, user)
             return await self.e.db.run(self.listing, user, form["section"], search=text.strip())
         if name == "form":
             field, item_id = form["field"], form.get("id")
-            if field in {"rotation_lead", "rotation_messages"}:
+            if field == "chat_interval":
+                await self.e.db.run(self.e.set_chat_interval, item_id, int(text))
+                result = await self.e.db.run(self.card, user, "chats", item_id)
+            elif field in {"rotation_lead", "rotation_messages"}:
                 campaign = await self.e.db.run(self.e.db.one, "SELECT * FROM campaigns WHERE id=?", (item_id,))
                 await self.e.db.run(
                     self.e.set_rotation,
@@ -1733,6 +1914,7 @@ class Interface:
             elif field in {
                 "campaign_name",
                 "interval",
+                "chat_delay",
                 "limit",
                 "reply_cooldown",
                 "dm_greeting_phrase",
@@ -1741,11 +1923,14 @@ class Interface:
                 key = {
                     "campaign_name": "name",
                     "interval": "interval_seconds",
+                    "chat_delay": "chat_delay_seconds",
                     "limit": "chat_limit",
                     "reply_cooldown": "reply_cooldown",
                     "dm_greeting_phrase": "dm_greeting_phrase",
                     "dm_sticker_emoji": "dm_sticker_emoji",
                 }[field]
+                if field == "interval" and int(text) < 30:
+                    raise DomainError("Интервал в чат — минимум 30 секунд")
                 await self.e.db.run(
                     self.e.edit_campaign,
                     item_id,
@@ -1781,9 +1966,16 @@ class Interface:
                 old_text = form["texts"][-1]["text"]
                 form["texts"][-1] = {**template, "text": template.get("text") or old_text}
             elif step in {4, 6}:
-                value = int(text)
+                parts = text.replace("/", " ").split()
+                value = int(parts[0]) if step == 4 else int(text)
                 if value < 1:
                     raise DomainError("Введите положительное число")
+                if step == 4:
+                    if value < 30:
+                        raise DomainError("Интервал в чат — минимум 30 секунд")
+                    form["chat_delay"] = int(parts[1]) if len(parts) > 1 else 3
+                    if form["chat_delay"] < 3 or len(parts) > 2:
+                        raise DomainError("Введите интервал и паузу, например 300 / 3")
                 form["interval" if step == 4 else "limit"] = value
                 form["step"] += 1
             else:
@@ -1838,34 +2030,7 @@ class Interface:
                     "Подключение · Шаг 3 из 4\nВведите пароль двухэтапной аутентификации. Он не сохраняется.",
                     await self.e.db.run(self.cancel, user),
                 )
-            phone, session, telegram_id = result
-            if form.get("account_id"):
-                await self.e.db.run(self.e.save_session, form["account_id"], session, telegram_id)
-                account_id, choices = form["account_id"], []
-            else:
-                account_id, choices = await self.e.db.run(self.e.add_account, form["name"], phone, session, telegram_id)
-            await self.e.db.run(self.clear, user)
-            if choices:
-                return View(
-                    "Шаг 4 из 4\nВыберите рассылку для нового аккаунта. Подготовка уже началась автоматически.",
-                    grid(
-                        [
-                            await self.e.db.run(
-                                self.button,
-                                user,
-                                r["name"],
-                                "assign_account",
-                                {"id": account_id, "campaign_id": r["id"]},
-                                True,
-                            )
-                            for r in choices
-                        ]
-                    )
-                    + await self.e.db.run(self.nav, user, "accounts"),
-                )
-            view = await self.e.db.run(self.card, user, "accounts", account_id)
-            view.text = "✅ Аккаунт сохранён · Подготовка началась\n\n" + view.text
-            return view
+            return await self._save_authorized_account(user, result, form)
         if name == "import_chats":
             content = txt_content if txt_content is not None else text
             lines = list(dict.fromkeys(line.strip() for line in content.splitlines() if line.strip()))

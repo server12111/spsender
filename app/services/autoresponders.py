@@ -1,7 +1,6 @@
-import json
 import random
 
-from .core import DomainError, dump, row, rows
+from .core import DomainError, dump, row
 from .pairs import shift_role
 
 
@@ -16,59 +15,7 @@ class Autoresponders:
         )
 
     def _plan_group_replies(self, c, pair, campaign):
-        if campaign["status"] != "RUNNING" or not self._pair_ready(c, pair):
-            return
-        for intent in rows(
-            c,
-            "SELECT * FROM group_reply_intents WHERE pair_id=? AND status='WAITING' ORDER BY id LIMIT 8",
-            (pair["id"],),
-        ):
-            payload = json.loads(intent["payload"])
-            candidate = {**intent, "kind": "GROUP_REPLY", "payload": payload}
-            history = row(
-                c,
-                "SELECT * FROM reply_history WHERE campaign_id=? AND peer_id=? AND kind='group'",
-                (campaign["id"], payload["peer_id"]),
-            )
-            reserved = (
-                history
-                and history["reserved_job_id"]
-                and row(c, "SELECT status FROM dispatch_jobs WHERE id=?", (history["reserved_job_id"],))
-            )
-            unavailable = reserved and reserved["status"] in {"PENDING", "INFLIGHT", "UNKNOWN"}
-            cooldown = (
-                history
-                and history["last_replied_at"] is not None
-                and (self.clock() - history["last_replied_at"] < campaign["reply_cooldown"])
-            )
-            account = row(c, "SELECT * FROM accounts WHERE id=?", (intent["account_id"],))
-            if (
-                not campaign["group_reply_enabled"]
-                or unavailable
-                or cooldown
-                or not self._job_allowed(c, candidate, account, pair, campaign)
-            ):
-                c.execute("UPDATE group_reply_intents SET status='CANCELLED' WHERE id=?", (intent["id"],))
-                continue
-            job_id = self._enqueue(
-                c,
-                pair,
-                campaign,
-                "GROUP_REPLY",
-                intent["chat_pool_id"],
-                intent["account_id"],
-                payload,
-                intent["idempotency_key"],
-            )
-            if job_id is None:
-                break
-            c.execute("UPDATE dispatch_jobs SET queue_rank=2 WHERE id=?", (job_id,))
-            c.execute("UPDATE group_reply_intents SET status='QUEUED',job_id=? WHERE id=?", (job_id, intent["id"]))
-            c.execute(
-                "INSERT INTO reply_history(campaign_id,peer_id,kind,reserved_job_id) VALUES (?,?,'group',?) "
-                "ON CONFLICT(campaign_id,peer_id,kind) DO UPDATE SET reserved_job_id=excluded.reserved_job_id",
-                (campaign["id"], payload["peer_id"], job_id),
-            )
+        self._cancel_group_replies(c, pair_id=pair["id"])
 
     def clear_reply_history(self, campaign_id):
         with self.db.tx() as c:
@@ -99,6 +46,8 @@ class Autoresponders:
         topic_id=0,
     ):
         """Preserved triggers: inbound PM, first PM, reply to this account's group message."""
+        if not private:
+            return []
         with self.db.tx() as c:
             own = {r[0] for r in c.execute("SELECT telegram_id FROM accounts WHERE telegram_id IS NOT NULL")}
             if bot or outgoing or sender_id in own:

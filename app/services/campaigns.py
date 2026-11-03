@@ -1,4 +1,4 @@
-from .core import DomainError, row, rows
+from .core import DomainError, dump, row, rows
 
 
 class Campaigns:
@@ -40,6 +40,8 @@ class Campaigns:
             return campaign_id
 
     def _write_templates(self, c, campaign_id, version, kind, texts):
+        if kind == "group":
+            raise DomainError("Автоответы доступны только в ЛС")
         if kind not in {"mailing", "greeting", "group", "dm_first", "dm_always"}:
             raise DomainError("Неизвестный тип шаблона")
         for i, value in enumerate(texts):
@@ -51,9 +53,20 @@ class Campaigns:
             if len(text.encode("utf-16-le")) // 2 > maximum:
                 raise DomainError("Текст превышает ограничение Telegram: 1024 с медиа, 4096 без медиа")
             c.execute(
-                "INSERT INTO campaign_templates(campaign_id,version,kind,position,text,media_path,media_kind) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (campaign_id, version, kind, i, text, path, value.get("media_kind")),
+                "INSERT INTO campaign_templates(campaign_id,version,kind,position,text,media_path,media_kind,legacy_options) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    campaign_id,
+                    version,
+                    kind,
+                    i,
+                    text,
+                    path,
+                    value.get("media_kind"),
+                    value.get("legacy_options", "{}")
+                    if isinstance(value.get("legacy_options", "{}"), str)
+                    else dump(value["legacy_options"]),
+                ),
             )
 
     def _campaign_options(self, c, campaign_id, options):
@@ -72,8 +85,12 @@ class Campaigns:
             "dm_greeting_phrase",
             "dm_sticker_emoji",
             "auto_subscribe",
+            "chat_delay_seconds",
+            "skip_unseen",
         }
         for key, value in options.items():
+            if key == "group_reply_enabled" and value:
+                raise DomainError("Автоответы доступны только в ЛС")
             if key not in allowed:
                 raise DomainError("Неизвестная настройка кампании")
             if key == "name":
@@ -87,6 +104,8 @@ class Campaigns:
                     raise DomainError(f"Введите непустое значение не длиннее {maximum} символов")
             if key == "selection" and value not in {"sequential", "random"}:
                 raise DomainError("Выберите последовательный или случайный порядок")
+            if key == "chat_delay_seconds" and int(value) < 3:
+                raise DomainError("Пауза между чатами — минимум 3 секунды")
             if key in {"reply_cooldown", "interval_seconds", "chat_limit"} and int(value) < 1:
                 raise DomainError("Значение должно быть положительным")
             c.execute(f"UPDATE campaigns SET {key}=? WHERE id=?", (value, campaign_id))
@@ -100,8 +119,8 @@ class Campaigns:
             c.execute("UPDATE campaigns SET version=? WHERE id=?", (version, campaign_id))
             self._campaign_options(c, campaign_id, options)
             c.execute(
-                "INSERT INTO campaign_templates(campaign_id,version,kind,position,text,media_path,media_kind) "
-                "SELECT campaign_id,?,kind,position,text,media_path,media_kind FROM campaign_templates "
+                "INSERT INTO campaign_templates(campaign_id,version,kind,position,text,media_path,media_kind,legacy_options) "
+                "SELECT campaign_id,?,kind,position,text,media_path,media_kind,legacy_options FROM campaign_templates "
                 "WHERE campaign_id=? AND version=? AND kind<>?",
                 (version, campaign_id, old["version"], template_kind or ""),
             )

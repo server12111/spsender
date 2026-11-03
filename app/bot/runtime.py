@@ -143,11 +143,28 @@ def make_dispatcher(ui):
             await ui.e.db.run(ui.e.diagnostic, "UI-database", exc)
             await message.answer("База временно недоступна. Повторите ввод позже")
             return
-        sensitive = state and state["state"] in {"account_code", "account_password", "account_phone"}
+        sensitive = state and state["state"] in {
+            "account_code",
+            "account_password",
+            "account_phone",
+            "account_import",
+            "account_import_password",
+        }
         try:
             text = message.text if message.text is not None else message.caption or ""
             template, txt_content = None, None
+            from app.legacy.creation import serialize_entities
+
+            legacy_options = {"entities_json": serialize_entities(message.entities or message.caption_entities)}
             document = message.document
+            if state and state["state"] == "account_import" and document:
+                if (document.file_size or 0) > 20 * 1024 * 1024:
+                    raise DomainError("Файл не должен превышать 20 МБ")
+                buffer = io.BytesIO()
+                await message.bot.download(document, destination=buffer)
+                view = await ui.import_account(user, document.file_name or "", buffer.getvalue())
+                await send_view(message.bot, message.chat.id, view)
+                return
             if state and state["state"] == "import_chats" and document:
                 if not (document.file_name or "").lower().endswith(".txt") or (document.file_size or 0) > 1024 * 1024:
                     raise DomainError("Нужен TXT UTF-8 размером до 1 МБ")
@@ -170,6 +187,10 @@ def make_dispatcher(ui):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 await message.bot.download(media, destination=path)
                 template = {"text": text, "media_path": str(path.resolve()), "media_kind": kind}
+            if state and state["state"] in {"campaign_wizard", "template_edit"}:
+                if template is None:
+                    template = {"text": text}
+                template["legacy_options"] = legacy_options
             view = await ui.message(user, text, template, txt_content)
         except (DomainError, ValueError, UnicodeError) as exc:
             error_text = str(exc) if isinstance(exc, DomainError) else "Проверьте формат данных и повторите ввод"
@@ -244,6 +265,12 @@ class BotNotificationSink:
             view = View(
                 f"⚠️ Рассылка №{payload['campaign_id']} приостановлена\nПричина: {label(payload['reason'])}\nИсправьте шаблон / медиа и возобновите рассылку.",
                 [[ui.button(admin_id, "📣 Рассылка", "card", {"id": payload["campaign_id"], "section": "campaigns"})]],
+            )
+        elif kind == "legacy_unknown":
+            view = View(
+                f"❓ Неизвестный результат операции прогрева №{payload['operation_id']}\nАккаунт №{payload['account_id']}\n"
+                "Аккаунт остановлен до сверки. Проверь историю Telegram.",
+                [[ui.button(admin_id, "🔎 Сверить прогрев", "legacy_unknown")]],
             )
         elif kind == "rotation_summary":
             view = View(
@@ -329,6 +356,13 @@ async def serve(engine, transport, worker_only=False):
     if not await engine.db.run(worker.runtime_lease):
         await bot.session.close()
         raise RuntimeError("Другой процесс уже обслуживает Telegram")
+    try:
+        engine.bot_username=(await bot.get_me()).username
+    except BaseException:
+        with engine.db.tx() as connection:
+            connection.execute("DELETE FROM worker_leases WHERE name='telegram-runtime' AND owner=?",(worker.owner,))
+        await bot.session.close()
+        raise
     tasks = [asyncio.create_task(worker.run())]
 
     async def notifications(urgent):

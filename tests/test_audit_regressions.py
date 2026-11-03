@@ -48,12 +48,7 @@ async def test_real_incoming_adapter_reaches_domain_handler(env, private):
     campaign, pair, _, _, chats = setup_pair(e, 1)
     active = e.pair_card(pair)["active_account_id"]
     telegram_id = e.db.scalar("SELECT telegram_id FROM accounts WHERE id=?", (active,))
-    e.edit_campaign(
-        campaign,
-        "dm_always" if private else "group",
-        ["Reply"],
-        **{"dm_always_enabled" if private else "group_reply_enabled": True},
-    )
+    e.edit_campaign(campaign, "dm_always", ["Reply"], dm_always_enabled=True)
     event = SimpleNamespace(
         raw_text="Hello",
         is_private=private,
@@ -67,8 +62,8 @@ async def test_real_incoming_adapter_reaches_domain_handler(env, private):
     )
     await adapter(e)._handle_incoming(active, event)
     assert event.get_sender.await_count == 1
-    assert e.db.scalar("SELECT count(*) FROM incoming_events") == 1
-    assert e.db.scalar("SELECT count(*) FROM dispatch_jobs WHERE kind IN ('DM_ALWAYS','GROUP_REPLY')") == 1
+    assert e.db.scalar("SELECT count(*) FROM incoming_events") == int(private)
+    assert e.db.scalar("SELECT count(*) FROM dispatch_jobs WHERE kind IN ('DM_ALWAYS','GROUP_REPLY')") == int(private)
     assert not e.db.scalar("SELECT count(*) FROM service_diagnostics")
 
 

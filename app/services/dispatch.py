@@ -67,6 +67,8 @@ class Dispatch:
         return job_id
 
     def _plan_dispatch(self, c, pair, campaign):
+        if getattr(self,"legacy_runtime_active",False):
+            return
         if campaign["status"] != "RUNNING" or not self._pair_ready(c, pair):
             return
         chats = self._assigned_chats(c, pair["id"])
@@ -202,6 +204,12 @@ class Dispatch:
         self.hourly_summary()
 
     def _job_allowed(self, c, job, account, pair, campaign):
+        if job["kind"] == "GROUP_REPLY":
+            return False
+        if account and row(
+            c, "SELECT 1 FROM legacy_rpc_journal WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN') LIMIT 1", (account["id"],)
+        ):
+            return False
         if campaign["status"] != "RUNNING" or campaign["version"] != job["version"]:
             return False
         if self._rotation_pair_blocked(c, pair["id"]):
@@ -627,7 +635,7 @@ class Dispatch:
     def recover_expired(self):
         with self.db.tx() as c:
             for job in rows(
-                c, "SELECT * FROM dispatch_jobs WHERE status='INFLIGHT' AND lease_until<=?", (self.clock(),)
+                c, "SELECT * FROM dispatch_jobs WHERE status='INFLIGHT' AND lease_until<=? AND json_extract(payload,'$._legacy_operation_id') IS NULL", (self.clock(),)
             ):
                 c.execute("UPDATE dispatch_jobs SET status='UNKNOWN',last_error='WORKER_LOST' WHERE id=?", (job["id"],))
                 c.execute(
@@ -645,6 +653,9 @@ class Dispatch:
         job = self.db.one("SELECT * FROM dispatch_jobs WHERE id=? AND status='UNKNOWN'", (job_id,))
         if not job:
             raise DomainError("Задание уже разобрано")
+        legacy=json.loads(job["payload"]).get("_legacy_operation_id")
+        if legacy:
+            return self.resolve_legacy_unknown(legacy,sent,api_message_id)
         if sent:
             job["payload"] = json.loads(job["payload"])
             job["attempt_id"] = self.db.scalar("SELECT max(id) FROM message_attempts WHERE job_id=?", (job_id,))

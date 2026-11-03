@@ -831,7 +831,7 @@ def test_upgrade_from_existing_v200_preserves_data_and_attempts(env, tmp_path):
     db.migrate()
     assert db.scalar("SELECT current_attempt_id FROM dispatch_jobs") == 7
     assert db.scalar("SELECT encrypted_session FROM account_sessions") == "cipher-preserved"
-    assert db.scalar("SELECT count(*) FROM schema_migrations") == 9
+    assert db.scalar("SELECT count(*) FROM schema_migrations") == 10
     assert not db.all("PRAGMA foreign_key_check")
 
 

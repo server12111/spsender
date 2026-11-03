@@ -1,0 +1,86 @@
+{
+  "archive_sha256": "29b3680277bc8e8716b4a7e32fb5da14ad2491608202e6bce0b96e36f7be0495",
+  "commit": "ee934abba845de1c0e74fd42cedc6b624af4609b",
+  "files": {
+    "services.py": {
+      "upstream": "bot/services.py",
+      "selection": "module nodes at lines 2111..3655 plus _FROZEN_ACCOUNT_MARKER",
+      "source_sha256": "9d46c5ad39e354c761dd57cf2e13ecadb0572af2ae32121aa436794b93b00343",
+      "upstream_sha256": "9d46c5ad39e354c761dd57cf2e13ecadb0572af2ae32121aa436794b93b00343",
+      "sha256": "9ee461f98ff325e6122537cc7fe1c383752538019a8d86a70ccaa6b634fda79b",
+      "identical_to_entire_upstream_file": false,
+      "adaptations": [
+        "Selected warmup nodes from original services module",
+        "SQLite/config/state adapter imports; original warmup methods retained"
+      ]
+    },
+    "warmup_extras.py": {
+      "upstream": "bot/warmup_extras.py",
+      "sha256": "8fac60e0315d6d40f78f4ec2148ed61ba02eb70c6d22b18014541a1ce8a3588a",
+      "upstream_sha256": "99dc3512b02fc161a3ff86153c443a83b016a58e2f4b99eb29f60200775c4379",
+      "adaptations": [
+        "Keyboard button data accessor for the installed Telethon TL schema",
+        "Do not vote in quizzes or bot/human verification polls"
+      ],
+      "identical_to_entire_upstream_file": false
+    },
+    "warmup_groups.py": {
+      "upstream": "bot/warmup_groups.py",
+      "sha256": "fea1bce84109b02863d370ea8b521cd83ff359333ecafffabff93c6caf390afe",
+      "upstream_sha256": "fea1bce84109b02863d370ea8b521cd83ff359333ecafffabff93c6caf390afe",
+      "identical_to_entire_upstream_file": true
+    },
+    "warmup_calls.py": {
+      "upstream": "bot/warmup_calls.py",
+      "sha256": "a96ffc32bca723e0a901e8a5cf44e857f0059e665a93cd1dd151fcbd28b5e80c",
+      "upstream_sha256": "a96ffc32bca723e0a901e8a5cf44e857f0059e665a93cd1dd151fcbd28b5e80c",
+      "identical_to_entire_upstream_file": true
+    },
+    "warmup_photos.py": {
+      "upstream": "bot/warmup_photos.py",
+      "sha256": "985005f96bb04f14c77e822acf6f7fe04df935d9a0e5fecc341f8941414d74df",
+      "upstream_sha256": "985005f96bb04f14c77e822acf6f7fe04df935d9a0e5fecc341f8941414d74df",
+      "identical_to_entire_upstream_file": true
+    },
+    "warmup_voices.py": {
+      "upstream": "bot/warmup_voices.py",
+      "sha256": "627c717cc769726b6e9e8cc2674a81e8faeed6bfbd24bcbe7c3e594ddb3e55da",
+      "upstream_sha256": "627c717cc769726b6e9e8cc2674a81e8faeed6bfbd24bcbe7c3e594ddb3e55da",
+      "identical_to_entire_upstream_file": true
+    },
+    "original_mailing.py": {
+      "upstream": "bot/services.py",
+      "source_sha256": "9d46c5ad39e354c761dd57cf2e13ecadb0572af2ae32121aa436794b93b00343",
+      "selection": "MailingService, helpers and operational constants",
+      "upstream_sha256": "9d46c5ad39e354c761dd57cf2e13ecadb0572af2ae32121aa436794b93b00343",
+      "sha256": "b6f0689c0c19f024b042ba96963b5774f2985e3cc28cabad6999c0a20296141e",
+      "identical_to_entire_upstream_file": false,
+      "adaptations": [
+        "Bridge imports and pair records",
+        "Preserve exact text instead of homoglyph substitutions",
+        "Timezone-aware fallback dates",
+        "Persisted target snapshot passed into delivery"
+      ]
+    },
+    "session_import.py": {
+      "upstream": "bot/userbot/session_import.py",
+      "sha256": "e9fc6d78c54a213e9a9f0a562d931141aab2c85956ff1ee58de20318feea09a0",
+      "upstream_sha256": "5e0226ea150e80e5fd513d02b45c227be8b2fc5b9ca87eb3348da3e61974961d",
+      "identical_to_entire_upstream_file": false
+    },
+    "creation.py": {
+      "upstream": "bot/handlers/mailings.py",
+      "source_sha256": "58e43ffaf319af55187427c9f5b6cd0be568f31542ead1c4f876d51a6176a051",
+      "selection": [
+        "_format_topic_ranges",
+        "_parse_topic_link",
+        "_parse_topic_ranges",
+        "parse_chat_link",
+        "serialize_entities"
+      ],
+      "upstream_sha256": "58e43ffaf319af55187427c9f5b6cd0be568f31542ead1c4f876d51a6176a051",
+      "sha256": "34a423f9b018c2b446bde90bf8862b2028cee0246872e06022e130f7f5cb84cc",
+      "identical_to_entire_upstream_file": false
+    }
+  }
+}

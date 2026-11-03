@@ -110,6 +110,11 @@ class Worker:
             asyncio.create_task(dispatching()),
             asyncio.create_task(listeners()),
         ]
+        if self.e.config.mode == "live":
+            from app.legacy.runtime import LegacyRuntime
+
+            legacy = LegacyRuntime(self.e, self.transport, self.owner, self.sink)
+            tasks.append(asyncio.create_task(legacy.run()))
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
