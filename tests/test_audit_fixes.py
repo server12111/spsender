@@ -46,6 +46,13 @@ def test_parse_target_still_rejects_garbage():
             parse_target(value)
 
 
+def test_parse_target_rejects_incomplete_invite_and_reserved_paths():
+    # An invite link with no hash must not be read as the public username @joinchat.
+    for value in ("https://t.me/joinchat/", "https://t.me/joinchat", "t.me/+", "https://t.me/c/1"):
+        with pytest.raises(DomainError):
+            parse_target(value)
+
+
 def _channel(forum):
     return types.Channel(id=4242, title="Группа", photo=None, date=None, megagroup=True, forum=forum)
 

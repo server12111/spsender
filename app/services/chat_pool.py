@@ -23,8 +23,10 @@ def parse_target(value):
     if match:
         return None, 0, "https://t.me/+" + match[1]
     # Public @username, optionally behind the /s/ web-preview prefix, with an optional message/topic id.
+    # Reserved path words (joinchat/s/c) are never usernames, so an incomplete invite like
+    # t.me/joinchat/ is rejected instead of being read as @joinchat.
     match = re.fullmatch(r"t\.me/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})(?:/(\d+))?", url)
-    if match:
+    if match and match[1].lower() not in {"joinchat", "s", "c"}:
         return None, int(match[2] or 0), "@" + match[1].lower()
     raise DomainError("Укажите ID[:тема], @username или ссылку t.me")
 
