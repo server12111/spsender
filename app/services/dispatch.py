@@ -138,7 +138,10 @@ class Dispatch:
             self._fill_waiting(c)
             cursor = row(c, "SELECT value FROM settings WHERE key='planner_cursor'")
             cursor = int(cursor["value"]) if cursor else 0
-            limit = pair_limit or self.config.planning_batch_size
+            # Honour the admin-configured "pairs per cycle" stored in SQLite, not just the
+            # static config default, so changing it in the UI actually takes effect.
+            stored = row(c, "SELECT value FROM settings WHERE key='planning_batch_size'")
+            limit = pair_limit or (int(stored["value"]) if stored else self.config.planning_batch_size)
             selected = rows(
                 c,
                 "SELECT p.id FROM pairs p JOIN campaigns ca ON ca.id=p.campaign_id WHERE ca.status<>'REMOVED' AND p.account_a_id IS NOT NULL AND p.id>? ORDER BY p.id LIMIT ?",
@@ -548,6 +551,16 @@ class Dispatch:
             campaign = row(c, "SELECT status,version FROM campaigns WHERE id=?", (job["campaign_id"],))
             if not campaign or campaign["status"] != "RUNNING" or campaign["version"] != job["version"]:
                 c.execute("UPDATE dispatch_jobs SET status='CANCELLED' WHERE id=? AND status='PENDING'", (job["id"],))
+            # A DM step that ends terminally (no retry left) must release its chain, otherwise it
+            # stays ACTIVE and blocks every future auto-reply to that peer.
+            if "dm_sequence_id" in job["payload"]:
+                final = row(c, "SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],))
+                if final and final["status"] in ("FAILED", "CANCELLED"):
+                    c.execute(
+                        "UPDATE dm_reply_sequences SET status='CANCELLED',current_job_id=NULL "
+                        "WHERE id=? AND status='ACTIVE' AND current_job_id=?",
+                        (job["payload"]["dm_sequence_id"], job["id"]),
+                    )
             self.audit(
                 c,
                 "JOB_ERROR",

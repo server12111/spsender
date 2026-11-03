@@ -19,6 +19,14 @@ from app.transport.fingerprint import LEGACY_DEVICE, parse_profile, random_profi
 from .base import OperationError, Result
 from .session import BoundedStringSession
 
+# Detect captcha / "prove you are human" prompts (RU + EN). Compiled once at import so a
+# broken pattern fails loudly here instead of raising re.error on every incoming message.
+CAPTCHA_GATE = re.compile(
+    r"captcha|капч|я\s+не\s+робот|not\s+a\s+robot|verify.*human|"
+    r"подтверд.*(?:челов|не\s*бот)|нажм.*кнопк|пройд.*(?:проверк|капч)",
+    re.IGNORECASE,
+)
+
 
 def classify_error(exc):
     name = type(exc).__name__
@@ -220,9 +228,7 @@ class TelegramTransport:
                 or current["flood_until"] > self.engine.clock()
             ):
                 return
-            gate = re.search(
-                r"captcha|????|? ?? ?????|verify.*human|???????????.*???????|?????.*??????", event.raw_text or "", re.I
-            )
+            gate = CAPTCHA_GATE.search(event.raw_text or "")
             if not event.is_private and not event.is_reply and not gate:
                 return
             sender = await asyncio.wait_for(event.get_sender(), 30)

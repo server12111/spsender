@@ -209,7 +209,7 @@ class Interface:
         if section == "accounts":
             where += " AND account_health<>'REMOVED'"
         if section == "pairs":
-            where += " AND account_a_id IS NOT NULL"
+            where += " AND account_a_id IS NOT NULL AND campaign_id IN (SELECT id FROM campaigns WHERE status<>'REMOVED')"
         records = self.e.db.all(f"SELECT * FROM {table}" + where + " ORDER BY id LIMIT 9 OFFSET ?", (*args, page * 8))
         count = self.e.db.scalar(f"SELECT count(*) FROM {table}" + where, args)
         buttons = []
@@ -465,7 +465,11 @@ class Interface:
                 "SELECT ca.* FROM campaigns ca JOIN campaign_members m ON m.campaign_id=ca.id WHERE m.account_id=?",
                 (item_id,),
             )
-            pair = self.e.db.one("SELECT * FROM pairs WHERE account_a_id=? OR account_b_id=?", (item_id, item_id))
+            pair = self.e.db.one(
+                "SELECT p.* FROM pairs p JOIN campaigns ca ON ca.id=p.campaign_id "
+                "WHERE (p.account_a_id=? OR p.account_b_id=?) AND ca.status<>'REMOVED'",
+                (item_id, item_id),
+            )
             shift = "Ожидает партнёра"
             n = 0
             if pair:

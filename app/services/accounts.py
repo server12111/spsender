@@ -94,6 +94,12 @@ class Accounts:
                     )
                     c.execute("UPDATE chat_pool SET status='FREE' WHERE id=?", (pc["chat_pool_id"],))
                 c.execute("UPDATE pairs SET account_a_id=NULL WHERE id=?", (pair["id"],))
+        # An unfinished DM reply chain left ACTIVE would keep blocking new auto-replies to
+        # that peer (autoresponders refuse while a chain is ACTIVE), so release it on detach.
+        c.execute(
+            "UPDATE dm_reply_sequences SET status='CANCELLED',current_job_id=NULL WHERE account_id=? AND status='ACTIVE'",
+            (account_id,),
+        )
         c.execute("DELETE FROM campaign_members WHERE account_id=?", (account_id,))
 
     def update_account(self, account_id, action, value=None):
@@ -122,7 +128,11 @@ class Accounts:
                     )
                     if action == "remove":
                         c.execute("DELETE FROM account_sessions WHERE account_id=?", (account_id,))
-                        c.execute("UPDATE accounts SET membership_status='REMOVED' WHERE id=?", (account_id,))
+                        # Release the UNIQUE telegram_id so the same Telegram account can be
+                        # added again later; the removed row is kept for history by its own id.
+                        c.execute(
+                            "UPDATE accounts SET membership_status='REMOVED',telegram_id=NULL WHERE id=?", (account_id,)
+                        )
                 c.execute(
                     "UPDATE dispatch_jobs SET status='CANCELLED' WHERE account_id=? AND status='PENDING'", (account_id,)
                 )

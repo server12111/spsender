@@ -162,4 +162,10 @@ class Campaigns:
                     "UPDATE chat_issues SET status='CLOSED' WHERE pair_id IN (SELECT id FROM pairs WHERE campaign_id=?)",
                     (campaign_id,),
                 )
+                # A removed campaign's chains can never proceed; release them so they do not
+                # keep blocking auto-replies to those peers.
+                c.execute(
+                    "UPDATE dm_reply_sequences SET status='CANCELLED',current_job_id=NULL WHERE campaign_id=? AND status='ACTIVE'",
+                    (campaign_id,),
+                )
             self.audit(c, "CAMPAIGN_" + status, campaign_id=campaign_id)
