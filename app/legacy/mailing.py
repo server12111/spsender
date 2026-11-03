@@ -13,13 +13,6 @@ target_context = ContextVar("legacy_mailing_target", default=None)
 
 
 class PairedMailingService(MailingService):
-    def _record_sent(self, target_id, account_id, mailing_id=None):
-        next_index = self._target_next_msg.get(target_id)
-        super()._record_sent(target_id, account_id, mailing_id)
-        if next_index is not None:
-            with self.runtime.engine.db.tx() as connection:
-                connection.execute("UPDATE pair_chats SET message_cursor=? WHERE id=?", (next_index, target_id))
-
     def __init__(self, runtime):
         self.runtime = runtime
         super().__init__(LegacyMailingDatabase(runtime.engine), runtime)
@@ -68,12 +61,14 @@ class PairedMailingService(MailingService):
         snapshot = kwargs.pop("target_snapshot", None)
         pair_id = mailing_context.get()
         engine = self.runtime.engine
+        selector = "pc.id=?" if snapshot is not None else "(cp.link=? OR cast(cp.chat_id AS TEXT)=?)"
+        identity = (snapshot.id,) if snapshot is not None else (str(target), str(target))
         item = await engine.db.run(
             engine.db.one,
             "SELECT pc.*,cp.chat_id,cp.topic_id,cp.link,p.campaign_id,c.version,c.timezone FROM pair_chats pc "
             "JOIN chat_pool cp ON cp.id=pc.chat_pool_id JOIN pairs p ON p.id=pc.pair_id JOIN campaigns c ON c.id=p.campaign_id "
-            "WHERE pc.pair_id=? AND pc.removed_at IS NULL AND (cp.link=? OR cast(cp.chat_id AS TEXT)=?) LIMIT 1",
-            (pair_id, str(target), str(target)),
+            "WHERE pc.pair_id=? AND pc.removed_at IS NULL AND " + selector + " LIMIT 1",
+            (pair_id, *identity),
         )
         if not item:
             raise OperationError("cancelled", "ASSIGNMENT_CHANGED")

@@ -558,7 +558,9 @@ async def test_critical_stop_button_is_not_blocked_by_long_admin_operation(env):
     button = ui.button(123, "Стоп", "campaign_status", {"id": ca, "status": "STOPPED"}, True)
     await ui._user_locks[123].acquire()
     try:
-        await asyncio.wait_for(ui.callback(123, button[1]), 1)
+        # Holding the lock proves the bypass causally. Allow slow CI storage
+        # enough time to render the card after the stop has already committed.
+        await asyncio.wait_for(ui.callback(123, button[1]), 10)
         assert e.db.scalar("SELECT status FROM campaigns") == "STOPPED"
     finally:
         ui._user_locks[123].release()

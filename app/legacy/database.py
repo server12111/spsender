@@ -64,6 +64,10 @@ class LegacyDatabase:
 
     def __init__(self, engine):
         self.engine = engine
+        if not hasattr(engine, "_legacy_state_revision"):
+            engine._legacy_state_revision = max(
+                time.time_ns(), engine.db.scalar("SELECT COALESCE(MAX(updated_at),0) FROM legacy_runtime_state")
+            )
         self._conn = Connection(self)
         self._transaction_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()

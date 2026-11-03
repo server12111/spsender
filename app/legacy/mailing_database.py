@@ -173,23 +173,10 @@ class LegacyMailingDatabase(LegacyDatabase):
         return {item["account_id"]: self.local(item["sent_at"]) for item in records}
 
     async def flush_target_last_sent(self, batch):
-        def write():
-            with self.engine.db.tx() as connection:
-                for target_id, item in batch.items():
-                    # Upstream batches are (id, datetime, account_id, next_index).
-                    sent_at, account_id, *cursor = item
-                    timestamp = (
-                        self.timestamp(sent_at)
-                        if not isinstance(sent_at, str)
-                        else self.timestamp(__import__("datetime").datetime.fromisoformat(sent_at))
-                    )
-                    connection.execute(
-                        "UPDATE pair_chats SET last_sent_at=MAX(COALESCE(last_sent_at,0),?),message_cursor=COALESCE(?,message_cursor),"
-                        "legacy_options=json_set(legacy_options,'$.last_account_id',?) WHERE id=?",
-                        (timestamp, cursor[0] if cursor else None, account_id, target_id),
-                    )
-
-        await self.engine.db.run(write)
+        # The RPC acknowledgement atomically commits these fields. An older
+        # upstream flush must never roll back that cursor or attribute a later
+        # delivery to the previous account.
+        return None
 
     def note_mailing_sent(self, mailing_id, target_id):
         # Confirmations and counters are committed by the guarded RPC journal.

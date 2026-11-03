@@ -168,7 +168,7 @@ async def _load_pyrogram_tdesktop(file_path: str, work_dir: str) -> TDesktop:
     return tdesk
 
 
-async def _load_telethon_old_client(file_path: str, work_dir: str, proxy=None, use_ipv6: bool = False) -> OpenteleTelegramClient:
+async def _load_telethon_old_client(file_path: str, work_dir: str, proxy=None, use_ipv6: bool = False, register_client=None) -> OpenteleTelegramClient:
     session_path = os.path.join(work_dir, "imported")
     with open(file_path, "rb") as src, open(session_path + ".session", "wb") as dst:
         dst.write(src.read())
@@ -179,6 +179,8 @@ async def _load_telethon_old_client(file_path: str, work_dir: str, proxy=None, u
     # under a different, chosen API — so which API this transient client
     # itself connects with doesn't matter.
     old_client = OpenteleTelegramClient(session_path, api=API.TelegramDesktop, proxy=proxy, use_ipv6=use_ipv6)
+    if register_client:
+        register_client(old_client)
     try:
         await old_client.connect()
     except Exception as e:
@@ -197,13 +199,10 @@ async def cleanup_import_source(source) -> None:
     there's nothing to close."""
     if isinstance(source, TDesktop):
         return
-    try:
-        await source.disconnect()
-    except Exception:
-        pass
+    await source.disconnect()
 
 
-async def load_import_source(kind: str, file_path: str, work_dir: str, proxy=None, use_ipv6: bool = False):
+async def load_import_source(kind: str, file_path: str, work_dir: str, proxy=None, use_ipv6: bool = False, register_client=None):
     """Read the uploaded file into whatever local, not-yet-network-authorized
     representation opentele needs for the next step: a `TDesktop` for
     "tdata"/"pyrogram_session", or an already-connected opentele
@@ -218,13 +217,13 @@ async def load_import_source(kind: str, file_path: str, work_dir: str, proxy=Non
     if kind == "pyrogram_session":
         return await _load_pyrogram_tdesktop(file_path, work_dir)
     if kind == "telethon_session":
-        return await _load_telethon_old_client(file_path, work_dir, proxy=proxy, use_ipv6=use_ipv6)
+        return await _load_telethon_old_client(file_path, work_dir, proxy=proxy, use_ipv6=use_ipv6, register_client=register_client)
     raise ImportRejected("❌ Неизвестный формат файла.")
 
 
 async def create_new_session(
     source, target_api: APIData, password: Optional[str] = None,
-    proxy=None, use_ipv6: bool = False,
+    proxy=None, use_ipv6: bool = False, register_client=None,
 ) -> OpenteleTelegramClient:
     """Perform the actual safe re-authorization step (QR-login-approval)
     against either a `TDesktop` (tdata / converted-Pyrogram) or an already-
@@ -257,6 +256,8 @@ async def create_new_session(
     except OpenTeleException as e:
         raise ImportRejected(f"❌ Не удалось авторизовать новую сессию: {e}")
 
+    if register_client:
+        register_client(new_client)
     if not await new_client.is_user_authorized():
         await new_client.disconnect()
         raise ImportRejected("❌ Не удалось авторизовать новую сессию.")

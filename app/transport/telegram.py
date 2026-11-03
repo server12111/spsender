@@ -237,7 +237,7 @@ class TelegramTransport:
         self._incoming_workers = [asyncio.create_task(consume()) for _ in range(2)]
 
     async def _handle_incoming(self, account_id, event):
-        legacy=getattr(self,"legacy_runtime",None)
+        legacy = getattr(self, "legacy_runtime", None)
         if legacy and event.chat_id in legacy._warmup_chats:
             return
         try:
@@ -335,7 +335,12 @@ class TelegramTransport:
         eligible = await self.engine.db.run(
             self.engine.db.all,
             "SELECT a.id,s.encrypted_session FROM accounts a JOIN account_sessions s ON s.account_id=a.id LEFT JOIN campaign_members m ON m.account_id=a.id LEFT JOIN campaigns ca ON ca.id=m.campaign_id LEFT JOIN legacy_warmup_settings w ON w.account_id=a.id WHERE a.account_health='OK' AND a.paused=0 AND a.onboarding_started_at<=? AND a.flood_until<=? AND a.connection_retry_at<=? AND (ca.status='RUNNING' OR (?=1 AND m.account_id IS NULL AND w.enabled=1)) ORDER BY a.id",
-            (self.engine.clock() - 86400, self.engine.clock(), self.engine.clock(),bool(getattr(self.engine,"legacy_runtime_active",False))),
+            (
+                self.engine.clock() - 86400,
+                self.engine.clock(),
+                self.engine.clock(),
+                bool(getattr(self.engine, "legacy_runtime_active", False)),
+            ),
         )
         ids = {a["id"] for a in eligible}
         retiring = sorted(account_id for account_id in self.clients if account_id not in ids)
@@ -740,11 +745,20 @@ class AccountAuthorizer:
         directory = tempfile.TemporaryDirectory(prefix="fe-account-import-")
         path = Path(directory.name) / ("source.zip" if kind == "tdata" else "source.session")
         path.write_bytes(content)
-        self.pending[admin_id] = {"directory": directory, "at": self.engine.clock(), "import": True}
+        pending = {"directory": directory, "at": self.engine.clock(), "import": True}
+        self.pending[admin_id] = pending
         try:
             if kind == "session":
                 kind = await asyncio.to_thread(sqlite_session_kind, str(path))
-            source = await asyncio.wait_for(load_import_source(kind, str(path), directory.name), 90)
+            source = await asyncio.wait_for(
+                load_import_source(
+                    kind,
+                    str(path),
+                    directory.name,
+                    register_client=lambda client: pending.__setitem__("source", client),
+                ),
+                90,
+            )
             self.pending[admin_id]["source"] = source
             return await self._finish_import(admin_id)
         except BaseException:
@@ -757,7 +771,11 @@ class AccountAuthorizer:
         if not pending or not pending.get("import") or self.engine.clock() - pending["at"] > 600:
             await self._cancel(admin_id)
             raise ValueError("Импорт истёк. Начните заново")
-        return await self._finish_import(admin_id, password)
+        try:
+            return await self._finish_import(admin_id, password)
+        except BaseException:
+            await self._cancel(admin_id)
+            raise
 
     async def _finish_import(self, admin_id, password=None):
         from opentele.api import APIData
@@ -765,18 +783,21 @@ class AccountAuthorizer:
         from app.legacy.session_import import ImportPasswordRequired, create_new_session
 
         pending = self.pending[admin_id]
-        try:
-            client = await asyncio.wait_for(
-                create_new_session(
-                    pending["source"],
-                    APIData(api_id=self.engine.config.api_id, api_hash=self.engine.config.api_hash),
-                    password=password,
-                ),
-                90,
-            )
-        except ImportPasswordRequired:
-            return None
-        pending["client"] = client
+        client = pending.get("client")
+        if client is None:
+            try:
+                client = await asyncio.wait_for(
+                    create_new_session(
+                        pending["source"],
+                        APIData(api_id=self.engine.config.api_id, api_hash=self.engine.config.api_hash),
+                        password=password,
+                        register_client=lambda client: pending.__setitem__("client", client),
+                    ),
+                    90,
+                )
+            except ImportPasswordRequired:
+                return None
+            pending["client"] = client
         me = await asyncio.wait_for(client.get_me(), 30)
         if not me or getattr(me, "bot", False) or not getattr(me, "phone", None):
             raise ValueError("Сессия должна принадлежать вашему пользовательскому аккаунту")
@@ -792,11 +813,12 @@ class AccountAuthorizer:
             self.pending[admin_id] = {"phone": phone, "at": self.engine.clock()}
             return
         client = self.transport.new_client(updates=False)
+        self.pending[admin_id] = {"client": client, "phone": phone, "at": self.engine.clock()}
         try:
             await asyncio.wait_for(client.connect(), 30)
             sent = await asyncio.wait_for(client.send_code_request(phone), 30)
         except BaseException:
-            await asyncio.wait_for(client.disconnect(), 10)
+            await self._cancel(admin_id)
             raise
         self.pending[admin_id] = {
             "client": client,
@@ -838,18 +860,34 @@ class AccountAuthorizer:
         await self._cancel(admin_id)
 
     async def _cancel(self, admin_id):
-        pending = self.pending.pop(admin_id, None)
-        if pending and "client" in pending:
-            await asyncio.wait_for(pending["client"].disconnect(), 10)
-        if pending and "source" in pending:
-            from app.legacy.session_import import cleanup_import_source
+        pending = self.pending.get(admin_id)
+        if not pending:
+            return
+        failures = []
+        for field in ("client", "source"):
+            if field not in pending:
+                continue
+            try:
+                if field == "source":
+                    from app.legacy.session_import import cleanup_import_source
 
-            await asyncio.wait_for(cleanup_import_source(pending["source"]), 10)
-        if pending and "directory" in pending:
+                    await asyncio.wait_for(cleanup_import_source(pending[field]), 10)
+                else:
+                    await asyncio.wait_for(pending[field].disconnect(), 10)
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                pending.pop(field)
+        if "directory" in pending and not any(field in pending for field in ("client", "source")):
             import tempfile
+
             if not Path(pending["directory"].name).resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
                 raise ValueError("Небезопасный путь временного импорта")
             await asyncio.to_thread(pending["directory"].cleanup)
+            pending.pop("directory")
+        if failures:
+            raise next((exc for exc in failures if isinstance(exc, asyncio.CancelledError)), failures[0])
+        self.pending.pop(admin_id, None)
 
     async def expire(self):
         for admin_id in list(self.pending):

@@ -64,9 +64,13 @@
     },
     "session_import.py": {
       "upstream": "bot/userbot/session_import.py",
-      "sha256": "e9fc6d78c54a213e9a9f0a562d931141aab2c85956ff1ee58de20318feea09a0",
+      "sha256": "afc93fd1655d3a4fb1d8ab4a17fc1ea7480ec45642c3b389692dcd0860e39809",
       "upstream_sha256": "5e0226ea150e80e5fd513d02b45c227be8b2fc5b9ca87eb3348da3e61974961d",
-      "identical_to_entire_upstream_file": false
+      "identical_to_entire_upstream_file": false,
+      "adaptations": [
+        "Register transient clients before connect/authorization validation",
+        "Propagate disconnect failures so cleanup can be retried"
+      ]
     },
     "creation.py": {
       "upstream": "bot/handlers/mailings.py",

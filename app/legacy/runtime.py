@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 from weakref import WeakValueDictionary
 
+from telethon.errors import UserAlreadyParticipantError
+
 from app.transport.base import OperationError
 from app.transport.limits import RPCBudget
 from app.transport.telegram import TelegramTransport, can_publish, classify_error
@@ -22,6 +24,7 @@ from .database import LegacyDatabase
 from .mailing import PairedMailingService, mailing_context, target_context
 
 DELIVERY_METHODS = {"send_message", "send_file", "forward_messages", "SendInlineBotResultRequest"}
+JOIN_METHODS = {"JoinChannelRequest", "ImportChatInviteRequest"}
 group_flow = ContextVar("legacy_warmup_group_flow", default=None)
 
 
@@ -149,6 +152,18 @@ class GuardedClient:
             except StopAsyncIteration:
                 raise
             except BaseException as exc:
+                if operation and name in JOIN_METHODS and isinstance(exc, UserAlreadyParticipantError):
+                    # Membership is already satisfied. This known outcome must
+                    # not become UNKNOWN and block an otherwise healthy account.
+                    result = SimpleNamespace()
+                    try:
+                        await engine.db.run(runtime.end_operation, operation, result, None)
+                    except Exception as persistence_error:
+                        await runtime.persistence_failure(
+                            operation, self.account_id, target, persistence_error, "MEMBERSHIP_ALREADY_CONFIRMED"
+                        )
+                        raise
+                    return result
                 error = exc if isinstance(exc, OperationError) else classify_error(exc)
                 if isinstance(exc, asyncio.CancelledError):
                     error = OperationError("unknown" if request_started else "cancelled", "WORKER_CANCELLED")
@@ -301,20 +316,10 @@ class LegacyRuntime:
         progress = {}
         target = target_context.get()
         if target:
-            progress = {
-                key: target[key]
-                for key in (
-                    "id",
-                    "pair_id",
-                    "chat_pool_id",
-                    "campaign_id",
-                    "chat_id",
-                    "version",
-                    "message_cursor",
-                    "delivery_seq",
-                    "next_index",
-                )
-            }
+            fields = ("id", "pair_id", "chat_pool_id", "campaign_id", "chat_id", "version")
+            if name in DELIVERY_METHODS:
+                fields += ("message_cursor", "delivery_seq", "next_index")
+            progress = {key: target[key] for key in fields}
         for key, item in () if target else self.service._dialog_progress.items():
             if account_id in (item["a"], item["b"]):
                 progress = {"dialog": key, "script": item["script"], "pos": item["pos"]}
@@ -330,6 +335,11 @@ class LegacyRuntime:
                         "SELECT next_action_at FROM legacy_warmup_settings WHERE account_id=?", (account_id,)
                     )
                 }
+        if name in JOIN_METHODS:
+            # Joining is idempotent at Telegram, whereas membership can change
+            # after an earlier successful join. Journal each paced attempt; an
+            # UNKNOWN attempt is still blocked by the account guard.
+            progress["join_attempt"] = uuid4().hex
         intent = (
             [account_id, name, progress]
             if target and name in {"send_message", "send_file", "forward_messages"}
@@ -344,7 +354,7 @@ class LegacyRuntime:
             if old and old["status"] in {"INFLIGHT", "UNKNOWN"}:
                 raise OperationError("cancelled", "LEGACY_RESULT_UNRESOLVED")
             now = self.engine.clock()
-            if target:
+            if target and name in DELIVERY_METHODS:
                 connection.execute(
                     "UPDATE pairs SET pair_dispatch_started_at=COALESCE(pair_dispatch_started_at,?),active_since=COALESCE(active_since,?) WHERE id=?",
                     (now, now, target["pair_id"]),

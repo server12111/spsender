@@ -37,8 +37,15 @@ class LegacyFeatures:
             or campaign["interval_seconds"]
         )
         connection.execute(
-            "UPDATE pair_chats SET last_sent_at=?,cooldown_until=MAX(cooldown_until,?),last_result='CONFIRMED',delivery_seq=delivery_seq+1,message_cursor=? WHERE id=? AND delivery_seq=?",
-            (now, now + interval, context["next_index"], context["id"], context["delivery_seq"]),
+            "UPDATE pair_chats SET last_sent_at=?,cooldown_until=MAX(cooldown_until,?),last_result='CONFIRMED',delivery_seq=delivery_seq+1,message_cursor=?,legacy_options=json_set(legacy_options,'$.last_account_id',?) WHERE id=? AND delivery_seq=?",
+            (
+                now,
+                now + interval,
+                context["next_index"],
+                operation["account_id"],
+                context["id"],
+                context["delivery_seq"],
+            ),
         )
         attempt = row(connection, "SELECT current_attempt_id FROM dispatch_jobs WHERE id=?", (job_id,))[
             "current_attempt_id"
@@ -151,6 +158,7 @@ class LegacyFeatures:
                 )
 
     def resolve_legacy_unknown(self, operation_id, performed, api_message_id=None):
+        removed_states = []
         with self.db.tx() as connection:
             item = row(connection, "SELECT * FROM legacy_rpc_journal WHERE id=? AND status='UNKNOWN'", (operation_id,))
             if not item:
@@ -187,6 +195,7 @@ class LegacyFeatures:
                 progress = json.loads(self.secrets.decrypt(state["value"]))
                 if item["account_id"] in (progress["a"], progress["b"]):
                     connection.execute("DELETE FROM legacy_runtime_state WHERE key=?", (state["key"],))
+                    removed_states.append(state["key"])
             self.audit(
                 connection,
                 "LEGACY_UNKNOWN_RESOLVED",
@@ -194,3 +203,6 @@ class LegacyFeatures:
                 operation_id=operation_id,
                 performed=performed,
             )
+        for key in removed_states:
+            getattr(self, "_legacy_state_cache", {}).pop(key, None)
+            getattr(self, "_legacy_state_versions", {}).pop(key, None)
