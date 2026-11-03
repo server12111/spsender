@@ -3,9 +3,10 @@ import os
 import re
 import time
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 
 from cryptography.fernet import Fernet
+
+from app.paths import logs_dir
 
 
 class SecretBox:
@@ -29,7 +30,7 @@ def configure_logging():
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("telethon").setLevel(logging.CRITICAL)
     logging.getLogger("aiogram.event").setLevel(logging.CRITICAL)
-    folder = Path("data/logs")
+    folder = logs_dir()
     folder.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(folder, 0o700)

@@ -8,6 +8,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.paths import media_dir
 from app.services.core import DomainError
 
 from .interface import View
@@ -30,7 +31,7 @@ def shorten(text, limit):
 async def send_view(bot, chat_id, view):
     if view.media:
         path = Path(view.media).resolve()
-        if not path.is_relative_to(Path("data/media").resolve()) or not path.is_file():
+        if not path.is_relative_to(media_dir().resolve()) or not path.is_file():
             raise DomainError("Медиа недоступно")
         options = dict(chat_id=chat_id, caption=shorten(view.text, 1024), reply_markup=markup(view))
         if view.media_kind == "photo":
@@ -159,7 +160,7 @@ def make_dispatcher(ui):
                 if (media.file_size or 0) > 20 * 1024 * 1024:
                     raise DomainError("Медиа не должно превышать 20 МБ")
                 extension = {"photo": ".jpg", "video": ".mp4", "document": ".bin"}[kind]
-                path = Path("data/media") / (uuid4().hex + extension)
+                path = media_dir() / (uuid4().hex + extension)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 await message.bot.download(media, destination=path)
                 template = {"text": text, "media_path": str(path.resolve()), "media_kind": kind}

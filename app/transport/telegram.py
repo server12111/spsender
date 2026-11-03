@@ -11,6 +11,7 @@ from weakref import WeakValueDictionary
 
 from telethon import TelegramClient, errors, events, functions, types, utils
 
+from app.paths import media_dir
 from app.services.chat_pool import parse_target
 
 from .base import OperationError, Result
@@ -371,7 +372,7 @@ class TelegramTransport:
             sticker = random.choice(choices)
         if media:
             path = Path(media).resolve()
-            root = Path("data/media").resolve()
+            root = media_dir().resolve()
             if not path.is_relative_to(root) or not path.is_file():
                 raise OperationError("configuration", "MEDIA_UNAVAILABLE")
         await self.guard(job)

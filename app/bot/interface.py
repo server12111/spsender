@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from zoneinfo import ZoneInfo
 
+from app.paths import logs_dir
 from app.services.core import RUNTIME_LIMITS, DomainError, dump, row
 from app.services.greetings import greeting_pool
 
@@ -644,7 +645,7 @@ class Interface:
         text += "\n\nПоследние сбои служб:\n" + "\n".join(
             f"{self.time(r['created_at'])} · {r['component']} · {r['error_code']}" for r in logs
         )
-        text += "\n\nФайловый журнал: data/logs/diagnostics.log (ротация 3 × 5 МБ)."
+        text += f"\n\nФайловый журнал: {(logs_dir() / 'diagnostics.log').as_posix()} (ротация 3 × 5 МБ)."
         return View(text[:3900], self.nav(user, "errors"))
 
     def issues(self, user, page=0, records=None):

@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+from app.paths import default_database_path
+
 
 @dataclass(frozen=True)
 class Config:
@@ -63,7 +65,7 @@ class Config:
     def load(cls):
         load_dotenv()
         config = cls(
-            database_path=os.getenv("DATABASE_PATH", "data/fe_autosender.sqlite3"),
+            database_path=os.getenv("DATABASE_PATH") or default_database_path(),
             mode=os.getenv("MODE", "dry-run"),
             bot_token=os.getenv("BOT_TOKEN", ""),
             admin_ids=tuple(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()),
