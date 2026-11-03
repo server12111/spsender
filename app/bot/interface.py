@@ -54,6 +54,8 @@ def serialized(function):
                 "account_remove",
                 "resume_chat",
                 "archive_chat",
+                "cancel",
+                "main",
             }:
                 return await function(self, user, *args, **kwargs)
         async with self._user_locks[user]:
@@ -107,9 +109,14 @@ class Interface:
             record["data"] = json.loads(record["data"])
         return record
 
-    def clear(self, user):
+    def clear(self, user, expected_revision=None):
         with self.e.db.tx() as c:
-            c.execute("DELETE FROM ui_states WHERE admin_id=?", (user,))
+            if expected_revision is not None:
+                return c.execute(
+                    "DELETE FROM ui_states WHERE admin_id=? AND json_extract(data,'$._revision')=?",
+                    (user, expected_revision),
+                ).rowcount
+            return c.execute("DELETE FROM ui_states WHERE admin_id=?", (user,)).rowcount
 
     def time(self, timestamp):
         if timestamp is None:
@@ -1488,15 +1495,22 @@ class Interface:
                 raise DomainError("Подтвердите право публикации")
             count, failures = 0, []
             for value in form["lines"]:
+                if not await self._import_active(user, form):
+                    return await self.e.db.run(self.main, user, f"Импорт отменён. Уже обработано: {count}")
                 try:
                     chat_id, topic, link, title = await self.transport.resolve_target(value)
-                    await self.e.db.run(self.e.add_chat, chat_id, title, topic, link, **options)
+                    if not await self._import_active(user, form):
+                        return await self.e.db.run(self.main, user, f"Импорт отменён. Уже обработано: {count}")
+                    await self.e.db.run(
+                        self._import_chat, user, form["_revision"], chat_id, title, topic, link, options
+                    )
                     count += 1
                 except Exception as exc:
                     failures.append(
                         value[:60] + ": " + (str(exc) if isinstance(exc, ValueError) else "Не удалось определить чат")
                     )
-            await self.e.db.run(self.clear, user)
+            if not await self.e.db.run(self.clear, user, form["_revision"]):
+                return await self.e.db.run(self.main, user, f"Импорт отменён. Уже обработано: {count}")
             view = await self.e.db.run(self.listing, user, "chats")
             view.text = (
                 f"Обработано: {count}. Дубликаты объединены. Ошибок: {len(failures)}\n"
@@ -1519,6 +1533,23 @@ class Interface:
                 await self.e.db.run(self.cancel, user),
             )
         raise DomainError("Кнопка больше не поддерживается")
+
+    async def _import_active(self, user, form):
+        state = await self.e.db.run(self.state, user)
+        return bool(
+            state and state["state"] == "import_confirm" and state["data"].get("_revision") == form.get("_revision")
+        )
+
+    def _import_chat(self, user, revision, chat_id, title, topic, link, options):
+        with self.e.db.tx() as c:
+            state = row(c, "SELECT * FROM ui_states WHERE admin_id=? AND expires_at>?", (user, self.e.clock()))
+            if (
+                not state
+                or state["state"] != "import_confirm"
+                or json.loads(state["data"]).get("_revision") != revision
+            ):
+                raise DomainError("Импорт отменён")
+            return self.e._add_chat(c, chat_id, title, topic, link, **options)
 
     def import_confirmation(self, user, form):
         self.set_state(user, "import_confirm", form)
@@ -1727,7 +1758,7 @@ class Interface:
             return
         try:
             client = await self.transport.client(account_id)
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), 30)
         except Exception as exc:
             from app.transport.base import OperationError
             from app.transport.telegram import classify_error

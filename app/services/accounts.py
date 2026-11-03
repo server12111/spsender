@@ -81,6 +81,7 @@ class Accounts:
                 raise DomainError("Сначала дождитесь / сверьте текущую операцию пары")
             self._pause_clock(c, pair)
             c.execute("UPDATE dispatch_jobs SET status='CANCELLED' WHERE pair_id=? AND status='PENDING'", (pair["id"],))
+            self._cancel_group_replies(c, pair_id=pair["id"])
             other = pair["account_b_id"] if pair["account_a_id"] == account_id else pair["account_a_id"]
             if other:
                 # Clear first to respect UNIQUE(account_a_id)/UNIQUE(account_b_id).
@@ -96,6 +97,7 @@ class Accounts:
                     c.execute("UPDATE chat_pool SET status='FREE' WHERE id=?", (pc["chat_pool_id"],))
                 c.execute("UPDATE pairs SET account_a_id=NULL WHERE id=?", (pair["id"],))
         self._cancel_account_dm_sequences(c, account_id)
+        self._cancel_group_replies(c, account_id=account_id)
         c.execute("DELETE FROM campaign_members WHERE account_id=?", (account_id,))
 
     def update_account(self, account_id, action, value=None):
@@ -134,6 +136,7 @@ class Accounts:
                 if pair:
                     self._pause_clock(c, pair)
                     if action != "resume":
+                        self._cancel_group_replies(c, pair_id=pair["id"])
                         c.execute(
                             "UPDATE dispatch_jobs SET status='CANCELLED' WHERE pair_id=? AND status='PENDING' AND kind IN ('MAILING','GREETING','GROUP_REPLY','DM_FIRST','DM_ALWAYS','DM_MANUAL')",
                             (pair["id"],),

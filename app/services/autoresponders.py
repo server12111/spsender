@@ -1,9 +1,75 @@
+import json
 import random
 
-from .core import DomainError, row
+from .core import DomainError, dump, row, rows
+from .pairs import shift_role
 
 
 class Autoresponders:
+    def _cancel_group_replies(self, c, **scope):
+        if not scope or not set(scope) <= {"campaign_id", "account_id", "pair_id", "chat_pool_id"}:
+            raise ValueError("Invalid reply scope")
+        condition = " AND ".join(key + "=?" for key in scope)
+        c.execute(
+            "UPDATE group_reply_intents SET status='CANCELLED' WHERE status='WAITING' AND " + condition,
+            tuple(scope.values()),
+        )
+
+    def _plan_group_replies(self, c, pair, campaign):
+        if campaign["status"] != "RUNNING" or not self._pair_ready(c, pair):
+            return
+        for intent in rows(
+            c,
+            "SELECT * FROM group_reply_intents WHERE pair_id=? AND status='WAITING' ORDER BY id LIMIT 8",
+            (pair["id"],),
+        ):
+            payload = json.loads(intent["payload"])
+            candidate = {**intent, "kind": "GROUP_REPLY", "payload": payload}
+            history = row(
+                c,
+                "SELECT * FROM reply_history WHERE campaign_id=? AND peer_id=? AND kind='group'",
+                (campaign["id"], payload["peer_id"]),
+            )
+            reserved = (
+                history
+                and history["reserved_job_id"]
+                and row(c, "SELECT status FROM dispatch_jobs WHERE id=?", (history["reserved_job_id"],))
+            )
+            unavailable = reserved and reserved["status"] in {"PENDING", "INFLIGHT", "UNKNOWN"}
+            cooldown = (
+                history
+                and history["last_replied_at"] is not None
+                and (self.clock() - history["last_replied_at"] < campaign["reply_cooldown"])
+            )
+            account = row(c, "SELECT * FROM accounts WHERE id=?", (intent["account_id"],))
+            if (
+                not campaign["group_reply_enabled"]
+                or unavailable
+                or cooldown
+                or not self._job_allowed(c, candidate, account, pair, campaign)
+            ):
+                c.execute("UPDATE group_reply_intents SET status='CANCELLED' WHERE id=?", (intent["id"],))
+                continue
+            job_id = self._enqueue(
+                c,
+                pair,
+                campaign,
+                "GROUP_REPLY",
+                intent["chat_pool_id"],
+                intent["account_id"],
+                payload,
+                intent["idempotency_key"],
+            )
+            if job_id is None:
+                break
+            c.execute("UPDATE dispatch_jobs SET queue_rank=2 WHERE id=?", (job_id,))
+            c.execute("UPDATE group_reply_intents SET status='QUEUED',job_id=? WHERE id=?", (job_id, intent["id"]))
+            c.execute(
+                "INSERT INTO reply_history(campaign_id,peer_id,kind,reserved_job_id) VALUES (?,?,'group',?) "
+                "ON CONFLICT(campaign_id,peer_id,kind) DO UPDATE SET reserved_job_id=excluded.reserved_job_id",
+                (campaign["id"], payload["peer_id"], job_id),
+            )
+
     def clear_reply_history(self, campaign_id):
         with self.db.tx() as c:
             self.campaign(c, campaign_id)
@@ -44,8 +110,6 @@ class Autoresponders:
             campaign = self.campaign(c, pair["campaign_id"])
             if campaign["status"] != "RUNNING" or not self._pair_ready(c, pair):
                 return []
-            from .pairs import shift_role
-
             on_shift = (
                 pair["account_a_id"] if shift_role(self.clock(), campaign["timezone"]) == "A" else pair["account_b_id"]
             )
@@ -189,6 +253,22 @@ class Autoresponders:
                         (campaign["id"], peer_id, kind, job_id),
                     )
                     jobs.append(job_id)
+                else:
+                    c.execute(
+                        "INSERT OR IGNORE INTO group_reply_intents(campaign_id,pair_id,account_id,chat_pool_id,peer_id,"
+                        "payload,version,idempotency_key,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (
+                            campaign["id"],
+                            pair["id"],
+                            account_id,
+                            chat["chat_pool_id"],
+                            peer_id,
+                            dump(payload),
+                            campaign["version"],
+                            f"reply:{campaign['id']}:{account_id}:{peer_id}:{message_id}:{kind}",
+                            self.clock(),
+                        ),
+                    )
             if dm_steps:
                 job_id = self._create_dm_sequence(c, pair, campaign, account_id, peer_id, message_id, dm_steps)
                 if job_id is not None:
@@ -196,6 +276,11 @@ class Autoresponders:
             return jobs
 
     def manual_dm_reply(self, account_id, peer_id, message_id, template):
+        text, media = template.get("text", ""), template.get("media_path")
+        if not text.strip() and not media:
+            raise DomainError("Пришлите непустой текст или поддерживаемое медиа")
+        if len(text.encode("utf-16-le")) // 2 > (1024 if media else 4096):
+            raise DomainError("Текст превышает ограничение Telegram")
         with self.db.tx() as c:
             incoming = row(
                 c,
@@ -210,14 +295,23 @@ class Autoresponders:
             campaign = self.campaign(c, pair["campaign_id"])
             if campaign["status"] != "RUNNING" or not self._pair_ready(c, pair):
                 raise DomainError("Рассылка остановлена или пара не готова")
-            from .pairs import shift_role
-
             active = (
                 pair["account_a_id"] if shift_role(self.clock(), campaign["timezone"]) == "A" else pair["account_b_id"]
             )
             if account_id != active:
                 raise DomainError("Этот аккаунт вне своей смены. Ответьте из самого аккаунта")
-            return self._enqueue(
+            existing = row(
+                c,
+                "SELECT id,status FROM dispatch_jobs WHERE account_id=? AND kind='DM_MANUAL' "
+                "AND json_extract(payload,'$.peer_id')=? AND json_extract(payload,'$.reply_to')=? "
+                "AND status IN ('PENDING','INFLIGHT','UNKNOWN','CONFIRMED') ORDER BY id DESC LIMIT 1",
+                (account_id, peer_id, message_id),
+            )
+            if existing:
+                if existing["status"] == "UNKNOWN":
+                    raise DomainError("Сначала сверьте результат предыдущего ответа")
+                return existing["id"]
+            job_id = self._enqueue(
                 c,
                 pair,
                 campaign,
@@ -225,5 +319,8 @@ class Autoresponders:
                 None,
                 account_id,
                 {**template, "peer_id": peer_id, "reply_to": message_id, "incoming_at": incoming["created_at"]},
-                f"manual-reply:{account_id}:{peer_id}:{message_id}:{campaign['version']}",
+                f"manual-reply:{account_id}:{peer_id}:{message_id}",
             )
+            if job_id is None:
+                raise DomainError("Очередь заполнена. Повторите ответ позже: он ещё не поставлен в очередь")
+            return job_id

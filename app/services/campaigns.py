@@ -109,6 +109,7 @@ class Campaigns:
             c.execute(
                 "UPDATE dispatch_jobs SET status='CANCELLED' WHERE campaign_id=? AND status='PENDING'", (campaign_id,)
             )
+            self._cancel_group_replies(c, campaign_id=campaign_id)
             if "chat_limit" in options:
                 for pair in rows(c, "SELECT * FROM pairs WHERE campaign_id=?", (campaign_id,)):
                     limit = int(options["chat_limit"])
@@ -154,6 +155,7 @@ class Campaigns:
                     "UPDATE dispatch_jobs SET status='CANCELLED' WHERE campaign_id=? AND status='PENDING'",
                     (campaign_id,),
                 )
+                self._cancel_group_replies(c, campaign_id=campaign_id)
             if status == "REMOVED":
                 c.execute(
                     "UPDATE dm_reply_sequences SET status='CANCELLED' WHERE campaign_id=? AND status IN ('ACTIVE','FAILED')",

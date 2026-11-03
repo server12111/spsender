@@ -30,6 +30,7 @@ class Notifications:
         c.execute("UPDATE dispatch_jobs SET status='CANCELLED' WHERE account_id=? AND status='PENDING'", (account_id,))
         pair = row(c, "SELECT * FROM pairs WHERE account_a_id=? OR account_b_id=?", (account_id, account_id))
         if pair:
+            self._cancel_group_replies(c, pair_id=pair["id"])
             self._pause_clock(c, pair)
             c.execute("UPDATE pairs SET status='NEEDS_ATTENTION' WHERE id=?", (pair["id"],))
             c.execute(

@@ -174,6 +174,7 @@ class Dispatch:
                 self._sync_pair(c, pair)
                 pair = self._pair(c, pair["id"])
                 self._plan_dm_sequences(c, pair, campaign)
+                self._plan_group_replies(c, pair, campaign)
                 self._plan_dispatch(c, pair, campaign)
                 c.execute(
                     "INSERT INTO settings VALUES ('planner_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -483,7 +484,17 @@ class Dispatch:
             c.execute(
                 "UPDATE message_attempts SET outcome=?,error=? WHERE id=?", (status, error.code, job["attempt_id"])
             )
-            if error.category == "critical":
+            if error.category == "cancelled" and error.code == "CANCELLED_BEFORE_REQUEST":
+                pair = self._pair(c, job["pair_id"])
+                campaign = row(c, "SELECT * FROM campaigns WHERE id=?", (job["campaign_id"],))
+                account = row(c, "SELECT * FROM accounts WHERE id=?", (job["account_id"],))
+                if campaign and self._job_allowed(c, job, account, pair, campaign):
+                    c.execute(
+                        "UPDATE dispatch_jobs SET status='PENDING',lease_owner=NULL,lease_until=NULL,"
+                        "current_attempt_id=NULL,completed_at=NULL WHERE id=?",
+                        (job["id"],),
+                    )
+            elif error.category == "critical":
                 self._critical(c, job["account_id"], error.code, error.code)
             elif error.category == "flood":
                 self._flood_wait(c, job["account_id"], error.seconds)
@@ -519,6 +530,7 @@ class Dispatch:
                         job_id=job["id"],
                     )
             elif error.category == "manual" and job["chat_pool_id"]:
+                self._cancel_group_replies(c, chat_pool_id=job["chat_pool_id"])
                 c.execute(
                     "UPDATE account_chat_access SET manual_required=1,last_error=? WHERE account_id=? AND chat_pool_id=?",
                     (error.code, job["account_id"], job["chat_pool_id"]),
@@ -615,7 +627,17 @@ class Dispatch:
                 self.audit(c, "UNKNOWN_NOT_SENT", campaign_id=job["campaign_id"], job_id=job_id)
 
     async def run_one(self, transport, owner="worker", emergency_sink=None):
-        job = await self.db.run(self.claim_job, owner)
+        # Retain the claim result if shutdown arrives while its transaction commits.
+        claim = asyncio.create_task(self.db.run(self.claim_job, owner))
+        try:
+            job = await asyncio.shield(claim)
+        except asyncio.CancelledError:
+            from app.transport.base import OperationError
+
+            job = await claim
+            if job:
+                await self.db.run(self.fail_job, job, OperationError("cancelled", "CANCELLED_BEFORE_REQUEST"))
+            raise
         if not job:
             return False
         try:

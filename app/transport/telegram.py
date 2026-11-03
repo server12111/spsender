@@ -105,6 +105,8 @@ class TelegramTransport:
         self._incoming_workers = []
         self._incoming_dropped = 0
         self._sync_cursor = 0
+        self._closing = False
+        self._retiring = set()
 
     def new_client(self, session="", updates=True):
         return TelegramClient(
@@ -124,8 +126,12 @@ class TelegramTransport:
         )
 
     async def client(self, account_id):
+        if getattr(self, "_closing", False):
+            raise OperationError("cancelled", "TRANSPORT_CLOSING")
         lock = self._client_locks.setdefault(account_id, asyncio.Lock())
         async with lock:
+            if getattr(self, "_closing", False):
+                raise OperationError("cancelled", "TRANSPORT_CLOSING")
             account = await self.engine.db.run(
                 self.engine.db.one,
                 "SELECT a.*,s.encrypted_session FROM accounts a LEFT JOIN account_sessions s ON s.account_id=a.id WHERE a.id=?",
@@ -142,12 +148,11 @@ class TelegramTransport:
                 existing
                 and self._client_sessions.get(account_id) == account["encrypted_session"]
                 and existing.is_connected()
+                and account_id not in getattr(self, "_retiring", ())
             ):
                 return existing
             if existing:
-                self.clients.pop(account_id, None)
-                self._client_sessions.pop(account_id, None)
-                await asyncio.wait_for(existing.disconnect(), 10)
+                await self._disconnect_client(account_id, existing, timeout=10)
             if not account["encrypted_session"]:
                 raise OperationError("critical", "SESSION_EXPIRED")
             client = None
@@ -160,7 +165,7 @@ class TelegramTransport:
             except BaseException as exc:
                 if client:
                     try:
-                        await asyncio.wait_for(client.disconnect(), 5)
+                        await self._disconnect_client(account_id, client)
                     except Exception:
                         pass
                 if isinstance(exc, asyncio.CancelledError):
@@ -178,8 +183,10 @@ class TelegramTransport:
                 raise classified from None
             try:
                 await self.engine.db.run(self.engine.connection_succeeded, account_id)
+                if getattr(self, "_closing", False):
+                    raise OperationError("cancelled", "TRANSPORT_CLOSING")
             except BaseException:
-                await asyncio.wait_for(client.disconnect(), 5)
+                await self._disconnect_client(account_id, client)
                 raise
             self.clients[account_id] = client
             self._client_sessions[account_id] = account["encrypted_session"]
@@ -280,20 +287,35 @@ class TelegramTransport:
             (self.engine.clock() - 86400, self.engine.clock(), self.engine.clock()),
         )
         ids = {a["id"] for a in eligible}
-        for account_id in list(self.clients):
-            if account_id not in ids:
-                client = self.clients.pop(account_id)
-                self._client_sessions.pop(account_id, None)
+        retiring = sorted(account_id for account_id in self.clients if account_id not in ids)
+        cursor = getattr(self, "_sync_cursor", 0)
+        retired_batch = [account_id for account_id in retiring if account_id > cursor][
+            : self.engine.config.connection_batch_size
+        ]
+        if not retired_batch:
+            retired_batch = retiring[: self.engine.config.connection_batch_size]
+        retirement_slots = asyncio.Semaphore(min(4, self.engine.config.concurrency))
+
+        async def retire(account_id):
+            async with retirement_slots:
+                client = self.clients.get(account_id)
+                if client is None:
+                    return
                 try:
-                    await asyncio.wait_for(client.disconnect(), 5)
+                    await self._disconnect_client(account_id, client)
                 except Exception as exc:
                     await self.engine.db.run(self.engine.diagnostic, "disconnect", exc, account_id=account_id)
+
+        await asyncio.gather(*(retire(account_id) for account_id in retired_batch))
+        if retired_batch:
+            self._sync_cursor = retired_batch[-1]
         candidates = [
             a
             for a in eligible
             if a["id"] not in self.clients
             or not self.clients[a["id"]].is_connected()
             or self._client_sessions.get(a["id"]) != a["encrypted_session"]
+            or a["id"] in getattr(self, "_retiring", ())
         ]
         chosen = candidates[: self.engine.config.connection_batch_size]
         semaphore = asyncio.Semaphore(min(4, self.engine.config.concurrency))
@@ -436,17 +458,37 @@ class TelegramTransport:
             )
         client = await self.client(account["id"])
         if "t.me/+" in link:
-            invite = await client(functions.messages.CheckChatInviteRequest(link.rsplit("+", 1)[1]))
+            invite = await asyncio.wait_for(
+                client(functions.messages.CheckChatInviteRequest(link.rsplit("+", 1)[1])), 30
+            )
             entity = getattr(invite, "chat", None)
             if not entity:
                 raise ValueError("Для закрытого чата импортируйте числовой ID; вступление при импорте не выполняется")
         else:
-            entity = await client.get_entity(link)
+            entity = await asyncio.wait_for(client.get_entity(link), 30)
         if not isinstance(entity, (types.Chat, types.Channel)):
             raise ValueError("В пул разрешено добавлять только группы / каналы")
         return utils.get_peer_id(entity), topic, link, entity.title
 
+    async def _disconnect_client(self, account_id, client, timeout=5):
+        if not hasattr(self, "_retiring"):
+            self._retiring = set()
+        self._retiring.add(account_id)
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout)
+            if getattr(client, "is_connected", lambda: False)():
+                raise ConnectionError("CLIENT_STILL_CONNECTED")
+        except BaseException:
+            # Also retain half-created clients when connection cleanup fails.
+            self.clients.setdefault(account_id, client)
+            raise
+        if self.clients.get(account_id) is client:
+            self.clients.pop(account_id, None)
+            self._client_sessions.pop(account_id, None)
+        self._retiring.discard(account_id)
+
     async def close(self):
+        self._closing = True
         for task in self._incoming_workers:
             task.cancel()
         await asyncio.gather(*self._incoming_workers, return_exceptions=True)
@@ -454,10 +496,13 @@ class TelegramTransport:
         while not self._incoming.empty():
             self._incoming.get_nowait()
             self._incoming.task_done()
-        clients = list(self.clients.values())
-        self.clients.clear()
-        self._client_sessions.clear()
-        await asyncio.gather(*(asyncio.wait_for(client.disconnect(), 5) for client in clients), return_exceptions=True)
+
+        outcomes = await asyncio.gather(
+            *(self._disconnect_client(account_id, client) for account_id, client in list(self.clients.items())),
+            return_exceptions=True,
+        )
+        if any(isinstance(outcome, BaseException) for outcome in outcomes):
+            raise ConnectionError("CLIENT_DISCONNECT_FAILED")
 
 
 def auth_serialized(function):
@@ -538,6 +583,8 @@ class AccountAuthorizer:
 
     async def expire(self):
         for admin_id in list(self.pending):
+            if self._locks[admin_id].locked():
+                continue
             async with self._locks[admin_id]:
                 pending = self.pending.get(admin_id)
                 if pending and self.engine.clock() - pending["at"] > 600:

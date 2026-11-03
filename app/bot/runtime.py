@@ -300,13 +300,22 @@ async def serve(engine, transport, worker_only=False):
         while True:
             try:
                 await engine.deliver_notifications(sink, owner="urgent" if urgent else "normal", urgent=urgent)
-                await auth.expire()
             except Exception as exc:
                 await engine.db.run(engine.diagnostic, "notifications", exc)
             await asyncio.sleep(0.25 if urgent else 1)
 
     tasks.append(asyncio.create_task(notifications(True)))
     tasks.append(asyncio.create_task(notifications(False)))
+
+    async def auth_maintenance():
+        while True:
+            try:
+                await auth.expire()
+            except Exception as exc:
+                await engine.db.run(engine.diagnostic, "authorization-cleanup", exc)
+            await asyncio.sleep(1)
+
+    tasks.append(asyncio.create_task(auth_maintenance()))
     if not worker_only:
         dispatcher = make_dispatcher(ui)
         tasks.append(

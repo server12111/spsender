@@ -31,28 +31,44 @@ class ChatPool:
         split_allowed=False,
         join_allowed=False,
     ):
+        with self.db.tx() as c:
+            return self._add_chat(
+                c, chat_id, title, topic_id, link, approved, greeting_allowed, split_allowed, join_allowed
+            )
+
+    def _add_chat(
+        self,
+        c,
+        chat_id,
+        title,
+        topic_id=0,
+        link="",
+        approved=False,
+        greeting_allowed=False,
+        split_allowed=False,
+        join_allowed=False,
+    ):
         if chat_id >= 0 or topic_id < 0:
             raise DomainError("Некорректный ID чата / темы")
-        with self.db.tx() as c:
-            c.execute(
-                "INSERT OR IGNORE INTO chat_pool(chat_id,topic_id,title,link,approved,greeting_allowed,split_allowed,join_allowed,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (
-                    chat_id,
-                    topic_id,
-                    title[:200],
-                    link or str(chat_id),
-                    approved,
-                    greeting_allowed,
-                    split_allowed,
-                    join_allowed,
-                    self.clock(),
-                ),
-            )
-            chat = row(c, "SELECT * FROM chat_pool WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
-            self._fill_waiting(c)
-            self.audit(c, "CHAT_IMPORTED", chat_pool_id=chat["id"])
-            return chat["id"]
+        c.execute(
+            "INSERT OR IGNORE INTO chat_pool(chat_id,topic_id,title,link,approved,greeting_allowed,split_allowed,join_allowed,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                chat_id,
+                topic_id,
+                title[:200],
+                link or str(chat_id),
+                approved,
+                greeting_allowed,
+                split_allowed,
+                join_allowed,
+                self.clock(),
+            ),
+        )
+        chat = row(c, "SELECT * FROM chat_pool WHERE chat_id=? AND topic_id=?", (chat_id, topic_id))
+        self._fill_waiting(c)
+        self.audit(c, "CHAT_IMPORTED", chat_pool_id=chat["id"])
+        return chat["id"]
 
     def _fill_waiting(self, c):
         # Stable FIFO for deficits, then creation order. One global active allocation per chat.
@@ -130,6 +146,7 @@ class ChatPool:
                     (chat_id,),
                 )
             if not approved:
+                self._cancel_group_replies(c, chat_pool_id=chat_id)
                 c.execute(
                     "UPDATE pair_chats SET status='PAUSED_NEEDS_REVIEW' WHERE chat_pool_id=? AND removed_at IS NULL",
                     (chat_id,),
@@ -160,6 +177,7 @@ class ChatPool:
             (reason, pair_id, chat_pool_id),
         )
         if count >= 2 or forbidden:
+            self._cancel_group_replies(c, pair_id=pair_id, chat_pool_id=chat_pool_id)
             c.execute(
                 "UPDATE pair_chats SET status='PAUSED_NEEDS_REVIEW' WHERE pair_id=? AND chat_pool_id=? AND removed_at IS NULL",
                 (pair_id, chat_pool_id),
@@ -283,6 +301,7 @@ class ChatPool:
                 )
                 if previous and previous["manual_required"]:
                     continue
+                self._cancel_group_replies(c, chat_pool_id=chat["id"])
                 c.execute(
                     "INSERT INTO account_chat_access(account_id,chat_pool_id,manual_required) VALUES (?,?,1) "
                     "ON CONFLICT(account_id,chat_pool_id) DO UPDATE SET manual_required=1",
@@ -313,6 +332,7 @@ class ChatPool:
 
     def archive_chat(self, chat_id):
         with self.db.tx() as c:
+            self._cancel_group_replies(c, chat_pool_id=chat_id)
             assigned = row(c, "SELECT * FROM pair_chats WHERE chat_pool_id=? AND removed_at IS NULL", (chat_id,))
             c.execute(
                 "UPDATE pair_chats SET status='REMOVED',removed_at=? WHERE chat_pool_id=? AND removed_at IS NULL",

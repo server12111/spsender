@@ -6,18 +6,18 @@ SEND_KINDS = "('MAILING','GREETING','GROUP_REPLY','DM_FIRST','DM_ALWAYS','DM_MAN
 
 def period_bounds(period, now, tz):
     local = datetime.fromtimestamp(now, timezone.utc).astimezone(ZoneInfo(tz))
-    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
     if period == "today":
-        start, end = midnight, local + timedelta(seconds=1)
+        start = midnight
     elif period == "yesterday":
-        start, end = midnight - timedelta(days=1), midnight
+        return (midnight - timedelta(days=1)).timestamp(), midnight.timestamp()
     elif period in {"7", "30"}:
-        start, end = midnight - timedelta(days=int(period) - 1), local + timedelta(seconds=1)
+        start = midnight - timedelta(days=int(period) - 1)
     elif period == "all":
         return 0, now + 1
     else:
         raise ValueError("Неизвестный период")
-    return start.timestamp(), end.timestamp()
+    return start.timestamp(), now + 1
 
 
 class Statistics:
@@ -56,7 +56,7 @@ class Statistics:
         )
         attempt_where = (
             f" FROM message_attempts a JOIN dispatch_jobs j ON j.id=a.job_id WHERE a.started_at>=? AND a.started_at<? AND j.kind IN {SEND_KINDS}"
-            + condition
+            + (" AND a.account_id=?" if entity == "accounts" and entity_id is not None else condition)
         )
         # Snapshot reads do not acquire the SQLite writer lock. History stays in SQL.
         with self.db.read() as c:
