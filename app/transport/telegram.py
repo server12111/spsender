@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 import logging
 import random
 import re
@@ -13,6 +14,7 @@ from telethon import TelegramClient, errors, events, functions, types, utils
 
 from app.paths import media_dir
 from app.services.chat_pool import parse_target
+from app.transport.fingerprint import LEGACY_DEVICE, parse_profile, random_profile
 
 from .base import OperationError, Result
 from .session import BoundedStringSession
@@ -94,7 +96,8 @@ class TelegramTransport:
         self._incoming_dropped = 0
         self._sync_cursor = 0
 
-    def new_client(self, session="", updates=True):
+    def new_client(self, session="", updates=True, device=None):
+        device = device or LEGACY_DEVICE
         return TelegramClient(
             BoundedStringSession(session, entity_limit=self.engine.config.entity_cache_limit),
             self.engine.config.api_id,
@@ -105,9 +108,9 @@ class TelegramTransport:
             connection_retries=1,
             auto_reconnect=False,
             timeout=30,
-            device_model="FE AutoSender",
-            app_version="2.0",
-            system_version="Python",
+            device_model=device["device_model"],
+            app_version=device["app_version"],
+            system_version=device["system_version"],
             entity_cache_limit=self.engine.config.entity_cache_limit,
         )
 
@@ -141,7 +144,7 @@ class TelegramTransport:
             client = None
             try:
                 session = self.engine.secrets.decrypt(account["encrypted_session"])
-                client = self.new_client(session)
+                client = self.new_client(session, device=parse_profile(account["device_profile"]))
                 await asyncio.wait_for(client.connect(), 30)
                 if not await asyncio.wait_for(client.is_user_authorized(), 30):
                     raise OperationError("critical", "SESSION_EXPIRED")
@@ -475,10 +478,13 @@ class AccountAuthorizer:
     async def begin(self, admin_id, phone):
         self.engine.authorize(admin_id)
         await self._cancel(admin_id)
+        # One device profile per login, used for the code request, the sign-in and every
+        # later session connect, so Telegram sees one consistent device for this account.
+        device = random_profile()
         if self.engine.config.mode == "dry-run":
-            self.pending[admin_id] = {"phone": phone, "at": self.engine.clock()}
+            self.pending[admin_id] = {"phone": phone, "at": self.engine.clock(), "device": device}
             return
-        client = self.transport.new_client(updates=False)
+        client = self.transport.new_client(updates=False, device=device)
         try:
             await asyncio.wait_for(client.connect(), 30)
             sent = await asyncio.wait_for(client.send_code_request(phone), 30)
@@ -490,6 +496,7 @@ class AccountAuthorizer:
             "phone": phone,
             "hash": sent.phone_code_hash,
             "at": self.engine.clock(),
+            "device": device,
         }
 
     @auth_serialized
@@ -503,8 +510,9 @@ class AccountAuthorizer:
             if code != "00000":
                 raise ValueError("Тестовый код: 00000")
             digest = int(hashlib.sha256(pending["phone"].encode()).hexdigest()[:10], 16)
+            device = json.dumps(pending["device"])
             self.pending.pop(admin_id)
-            return pending["phone"], "dry-run-session", digest
+            return pending["phone"], "dry-run-session", digest, device
         client = pending["client"]
         try:
             if password is not None:
@@ -517,8 +525,9 @@ class AccountAuthorizer:
             return None
         session = client.session.save()
         phone = pending["phone"]
+        device = json.dumps(pending["device"])
         await self._cancel(admin_id)
-        return phone, session, me.id
+        return phone, session, me.id, device
 
     @auth_serialized
     async def cancel(self, admin_id):

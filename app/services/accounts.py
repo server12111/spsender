@@ -4,7 +4,7 @@ from .core import DomainError, row, rows
 
 
 class Accounts:
-    def add_account(self, name, phone, session="", telegram_id=None, campaign_id=None):
+    def add_account(self, name, phone, session="", telegram_id=None, campaign_id=None, device_profile=""):
         if not name.strip():
             raise DomainError("Укажите название аккаунта")
         now = self.clock()
@@ -14,7 +14,7 @@ class Accounts:
                 campaign_id = candidates[0]["id"]
             account_id = c.execute(
                 "INSERT INTO accounts(name,phone_mask,telegram_id,onboarding_started_at,stage_started_at,"
-                "account_health,created_at) VALUES (?,?,?,?,?,?,?)",
+                "account_health,device_profile,created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     name.strip()[:100],
                     mask_phone(phone),
@@ -22,6 +22,7 @@ class Accounts:
                     now,
                     now,
                     "OK" if session else "DISCONNECTED",
+                    device_profile or "",
                     now,
                 ),
             ).lastrowid
@@ -140,7 +141,7 @@ class Accounts:
                 raise DomainError("Неизвестное действие")
             self.audit(c, "ACCOUNT_" + action.upper(), account_id=account_id)
 
-    def save_session(self, account_id, session, telegram_id):
+    def save_session(self, account_id, session, telegram_id, device_profile=""):
         with self.db.tx() as c:
             account = row(c, "SELECT * FROM accounts WHERE id=?", (account_id,))
             if not account or account["account_health"] == "REMOVED":
@@ -151,6 +152,9 @@ class Accounts:
                 c, "SELECT 1 FROM dispatch_jobs WHERE account_id=? AND status IN ('INFLIGHT','UNKNOWN')", (account_id,)
             ):
                 raise DomainError("Сначала дождитесь / сверьте текущую операцию аккаунта")
+            if device_profile:
+                # A reconnect authorizes a fresh session with a fresh device; keep them paired.
+                c.execute("UPDATE accounts SET device_profile=? WHERE id=?", (device_profile, account_id))
             c.execute(
                 "UPDATE account_sessions SET encrypted_session=?,updated_at=? WHERE account_id=?",
                 (self.secrets.encrypt(session), self.clock(), account_id),

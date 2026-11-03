@@ -1564,12 +1564,14 @@ class Interface:
                     "Подключение · Шаг 3 из 4\nВведите пароль двухэтапной аутентификации. Он не сохраняется.",
                     await self.e.db.run(self.cancel, user),
                 )
-            phone, session, telegram_id = result
+            phone, session, telegram_id, device = result
             if form.get("account_id"):
-                await self.e.db.run(self.e.save_session, form["account_id"], session, telegram_id)
+                await self.e.db.run(self.e.save_session, form["account_id"], session, telegram_id, device)
                 account_id, choices = form["account_id"], []
             else:
-                account_id, choices = await self.e.db.run(self.e.add_account, form["name"], phone, session, telegram_id)
+                account_id, choices = await self.e.db.run(
+                    self.e.add_account, form["name"], phone, session, telegram_id, device_profile=device
+                )
             await self.e.db.run(self.clear, user)
             if choices:
                 return View(
