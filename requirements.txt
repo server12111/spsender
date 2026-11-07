@@ -1,1 +1,5 @@
 -e .
+# Hosting-compat shim: the bothost.ru build template probes `import telegram`
+# for any project mentioning it. The app itself uses aiogram + Telethon and
+# never imports this package at runtime.
+python-telegram-bot>=21.8,<23
