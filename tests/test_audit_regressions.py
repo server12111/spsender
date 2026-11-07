@@ -751,6 +751,34 @@ def test_flood_rest_is_configured_and_bounded():
         assert 600 <= _flood_rest() <= 900
 
 
+def test_unwritable_log_folder_never_stops_startup(tmp_path, monkeypatch):
+    """Hosting volumes can be root-owned: a logging failure must degrade, not crash."""
+    import logging as logging_module
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    from app.security.secrets import configure_logging
+
+    logger = logging_module.getLogger("fe_autosender")
+    saved = logger.handlers[:]
+    logger.handlers = [h for h in saved if not isinstance(h, RotatingFileHandler)]
+    original_mkdir = Path.mkdir
+
+    def denied(self, *args, **kwargs):
+        if self.name == "logs":
+            raise PermissionError(13, "Permission denied")
+        return original_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", denied)
+    try:
+        configure_logging(tmp_path / "logs")  # must not raise
+        assert not any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
+        configure_logging(tmp_path / "writable")  # healthy path still attaches the handler
+        assert any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
+    finally:
+        logger.handlers = saved
+
+
 def test_media_dir_is_anchored_to_database_location(env):
     from pathlib import Path
 

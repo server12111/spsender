@@ -31,15 +31,22 @@ def configure_logging(folder=None):
     logging.getLogger("aiogram.event").setLevel(logging.CRITICAL)
     # Anchor logs next to the database (persistent on hosting), not to the CWD.
     folder = Path(folder) if folder else Path("data/logs")
-    folder.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        os.chmod(folder, 0o700)
     logger = logging.getLogger("fe_autosender")
-    if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    if any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        return
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(folder, 0o700)
         handler = RotatingFileHandler(
             folder / "diagnostics.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
         )
-        formatter = logging.Formatter("%(asctime)s UTC %(levelname)s %(message)s")
-        formatter.converter = time.gmtime
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+    except OSError as exc:
+        # A read-only or foreign-owned data mount (hosting volumes are often
+        # root-owned) must never stop the bot: console logging stays intact.
+        logger.warning("file diagnostics unavailable in %s: %s", folder, type(exc).__name__)
+        return
+    formatter = logging.Formatter("%(asctime)s UTC %(levelname)s %(message)s")
+    formatter.converter = time.gmtime
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
