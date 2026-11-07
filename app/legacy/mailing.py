@@ -33,7 +33,7 @@ class PairedMailingService(MailingService):
         if task and task is not asyncio.current_task():
             task.cancel()
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        for mapping in (self._stagger_until, self._working_targets, self._message_rotation):
+        for mapping in (self._stagger_until, self._working_targets, self._message_rotation, self._spam_ctx):
             mapping.pop(mailing_id, None)
 
     def __init__(self, runtime):

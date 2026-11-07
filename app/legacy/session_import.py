@@ -11,6 +11,7 @@ hand a session to a different API identity: it asks the ALREADY-authorized
 session to approve a brand-new login, exactly like scanning a QR code from a
 device that's already logged in.
 """
+import asyncio
 import os
 import sqlite3
 import zipfile
@@ -78,9 +79,10 @@ def _find_tdata_root(extracted_dir: str) -> Optional[str]:
 
 
 def _safe_extract_tdata(zf: zipfile.ZipFile, extract_dir: str) -> None:
-    """Extract only what opentele needs, with a hard size cap — a 20MB
+    """Extract only what opentele needs, with a hard streamed size cap — a 20MB
     upload can otherwise decompress to gigabytes (zip bomb / a full media
-    cache) and fill the disk."""
+    cache) and fill the disk. The cap counts real bytes read, not the
+    archive's declared header sizes, so lying headers cannot bypass it."""
     members = [
         m for m in zf.infolist()
         if not m.is_dir()
@@ -88,8 +90,24 @@ def _safe_extract_tdata(zf: zipfile.ZipFile, extract_dir: str) -> None:
     ]
     if len(members) > _TDATA_MAX_ENTRIES or sum(m.file_size for m in members) > _TDATA_MAX_EXTRACT_BYTES:
         raise ImportRejected("❌ Архив слишком большой. Заархивируйте только папку tdata без кэша (user_data).")
+    extracted = 0
     for m in members:
-        zf.extract(m, extract_dir)
+        parts = [
+            p for p in m.filename.replace("\\", "/").split("/")
+            if p not in ("", ".", "..") and ":" not in p
+        ]
+        if not parts:
+            raise ImportRejected("❌ В архиве найден путь вне папки TData.")
+        target = os.path.join(extract_dir, *parts)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        member_bytes = 0
+        with zf.open(m) as src, open(target, "wb") as dst:
+            while chunk := src.read(1024 * 1024):
+                member_bytes += len(chunk)
+                if extracted + member_bytes > _TDATA_MAX_EXTRACT_BYTES:
+                    raise ImportRejected("❌ Архив слишком большой. Заархивируйте только папку tdata без кэша (user_data).")
+                dst.write(chunk)
+        extracted += member_bytes
 
 
 def sqlite_session_kind(path: str) -> Optional[str]:
@@ -213,7 +231,9 @@ async def load_import_source(kind: str, file_path: str, work_dir: str, proxy=Non
     `ImportPasswordRequired` can retry just the network step, without
     re-parsing the uploaded file."""
     if kind == "tdata":
-        return _load_tdata(file_path, work_dir)
+        # Zip extraction + TDesktop crypto parse are CPU/IO heavy and fully
+        # synchronous: they must not freeze the live event loop.
+        return await asyncio.to_thread(_load_tdata, file_path, work_dir)
     if kind == "pyrogram_session":
         return await _load_pyrogram_tdesktop(file_path, work_dir)
     if kind == "telethon_session":

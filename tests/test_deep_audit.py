@@ -71,10 +71,17 @@ async def test_manual_reply_is_not_duplicated_after_campaign_edit(env):
 
 @pytest.mark.parametrize(
     "template",
-    [{"text": ""}, {"text": " "}, {"text": "x" * 4097}, {"text": "x" * 1025, "media_path": "data/media/test.jpg"}],
+    [
+        {"text": ""},
+        {"text": " "},
+        {"text": "x" * 4097},
+        lambda e: {"text": "x" * 1025, "media_path": str(e.config.media_dir / "test.jpg")},
+    ],
 )
 def test_invalid_manual_reply_never_reaches_account_queue(env, template):
     e, _, _, _ = env
+    if callable(template):
+        template = template(e)
     _, pair, _, _, _ = setup_pair(e, 1)
     active = e.pair_card(pair)["active_account_id"]
     e.incoming(active, 500, 1, 500, True)

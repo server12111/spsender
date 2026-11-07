@@ -1,5 +1,6 @@
 """Regressions reproduced during the repository audit; all APIs are local fakes."""
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,7 +13,7 @@ from telethon import errors
 from app.bot.interface import Interface
 from app.bot.runtime import BotNotificationSink
 from app.services.core import DomainError
-from app.transport.base import OperationError, Result
+from app.transport.base import FakeNotificationSink, FakeTransport, OperationError, Result
 from app.transport.telegram import TelegramTransport, classify_error
 
 
@@ -493,3 +494,267 @@ def test_recovery_migration_preserves_unknown_and_repairs_known_orphans(env):
     assert e.db.scalar("SELECT count(*) FROM schema_migrations") == len(list(Path("app/db/migrations").glob("*.sql")))
     assert e.db.scalar("PRAGMA integrity_check") == "ok"
     assert not e.db.all("PRAGMA foreign_key_check")
+
+
+async def test_sibling_consumer_error_does_not_cancel_inflight_siblings(env, monkeypatch):
+    """One failed consumer must not cancel siblings mid-send into spurious UNKNOWN."""
+    import sqlite3
+
+    from app.scheduler.worker import Worker
+
+    e, _, _, _ = env
+    gate = asyncio.Event()
+    calls = []
+
+    async def flaky_run_one(transport, owner="worker", emergency_sink=None):
+        calls.append("claim")
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        await gate.wait()
+        calls.append("finished")
+        return True
+
+    monkeypatch.setattr(e, "run_one", flaky_run_one)
+    worker = Worker(e, FakeTransport(), FakeNotificationSink())
+    task = asyncio.create_task(worker.run_batch())
+    for _ in range(200):
+        await asyncio.sleep(0.005)
+        if calls.count("claim") >= 2:
+            break
+    assert calls.count("claim") >= 2
+    gate.set()
+    with pytest.raises(sqlite3.OperationalError):
+        await asyncio.wait_for(task, 5)
+    assert calls.count("finished") >= 1
+
+
+def test_planner_failure_does_not_wedge_following_pairs(env, monkeypatch):
+    e, _, _, _ = env
+    campaign, first_pair, _, _, _ = setup_pair(e, 1)
+    for i in range(2):
+        e.add_account(str(i), "+10000000099", "session", 2000 + i, campaign)
+    e.tick()
+    original = e._sync_pair
+
+    def failing(c, pair):
+        if pair["id"] == first_pair:
+            raise RuntimeError("planner boom")
+        original(c, pair)
+
+    monkeypatch.setattr(e, "_sync_pair", failing)
+    e.tick()
+    second_pair = e.db.scalar("SELECT max(id) FROM pairs")
+    assert e.db.scalar("SELECT value FROM settings WHERE key='planner_cursor'") == str(second_pair)
+    assert e.db.scalar("SELECT count(*) FROM service_diagnostics WHERE component='planner'") == 1
+
+
+async def test_flagged_transport_cancel_requeues_unsent_job(env):
+    """Cancellation before any write RPC re-queues instead of demanding reconciliation."""
+    e, _, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+    entered = asyncio.Event()
+
+    class Flagged(FakeTransport):
+        async def execute(self, job):
+            job["_request_may_have_been_sent"] = False
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(e.run_one(Flagged()))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert e.db.scalar("SELECT status FROM dispatch_jobs") == "PENDING"
+
+
+def test_confirmed_send_respects_inherited_cooldown(env):
+    e, clock, _, _ = env
+    campaign, pair, _, _, chats = setup_pair(e, 1)
+    e.tick()
+    job = e.claim_job("mail")
+    assert job["kind"] == "MAILING"
+    future = clock() + 5000
+    with e.db.tx() as c:
+        c.execute("UPDATE pair_chats SET cooldown_until=? WHERE pair_id=? AND chat_pool_id=?", (future, pair, chats[0]))
+    e.finish_job(job, Result(1))
+    assert (
+        e.db.scalar("SELECT cooldown_until FROM pair_chats WHERE pair_id=? AND chat_pool_id=?", (pair, chats[0]))
+        == future
+    )
+
+
+def test_blank_env_values_fall_back_to_defaults(monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("BATCH_SIZE", "")
+    monkeypatch.setenv("WORKER_INTERVAL", "")
+    config = Config.load()
+    assert config.batch_size == 32 and config.worker_interval == 2
+
+
+def test_invalid_env_value_names_the_variable(monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setattr("app.config.load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("CONCURRENCY", "abc")
+    with pytest.raises(ValueError, match="CONCURRENCY"):
+        Config.load()
+
+
+async def test_lease_renewal_keeps_live_claim_through_recovery(env):
+    """A queued-but-alive job must not be marked WORKER_LOST while renewing its lease."""
+    e, clock, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+    job = e.claim_job("renew")
+    clock.advance(200)
+    assert e.renew_job_lease(job) is True
+    assert e.db.scalar("SELECT lease_until FROM dispatch_jobs WHERE id=?", (job["id"],)) == clock() + 180
+    e.recover_expired()
+    assert e.db.scalar("SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],)) == "INFLIGHT"
+
+
+async def test_renewal_fails_for_lost_claim(env):
+    e, _, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+    job = e.claim_job("lost")
+    e.fail_job(job, OperationError("transient", "NETWORK_FAILURE"))
+    assert e.db.scalar("SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],)) == "PENDING"
+    assert e.renew_job_lease(job) is False
+
+
+async def test_admission_timeout_requeues_before_any_send(env, monkeypatch):
+    from app.transport import telegram as tg
+
+    e, _, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+    job = e.claim_job("admission")
+    transport = object.__new__(TelegramTransport)
+    transport.engine = e
+    transport._operation_locks = WeakValueDictionary()
+    transport._chat_operation_locks = WeakValueDictionary()
+
+    async def slow_admission():
+        await asyncio.sleep(1)
+
+    transport._operation_semaphore = SimpleNamespace(acquire=slow_admission, release=AsyncMock())
+    transport._execute_bounded = AsyncMock()
+    monkeypatch.setattr(tg, "ADMISSION_WAIT", 0.01)
+    with pytest.raises(OperationError) as exc:
+        await transport.execute(job)
+    assert exc.value.code == "CANCELLED_BEFORE_REQUEST"
+    transport._execute_bounded.assert_not_awaited()
+    transport._operation_semaphore.release.assert_not_awaited()
+    e.fail_job(job, exc.value)
+    assert e.db.scalar("SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],)) == "PENDING"
+
+
+async def test_lost_lease_aborts_execution_before_network(env):
+    e, clock, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+    job = e.claim_job("stolen")
+    transport = object.__new__(TelegramTransport)
+    transport.engine = e
+    transport._operation_locks = WeakValueDictionary()
+    transport._chat_operation_locks = WeakValueDictionary()
+    budget = SimpleNamespace(release=AsyncMock())
+    transport._operation_semaphore = SimpleNamespace(acquire=AsyncMock(return_value=budget), release=AsyncMock())
+    transport._execute_bounded = AsyncMock()
+    clock.advance(200)
+    e.recover_expired()  # lease expired: the job is no longer owned
+    with pytest.raises(OperationError) as exc:
+        await transport.execute(job)
+    assert exc.value.code == "STATE_CHANGED_BEFORE_REQUEST"
+    transport._execute_bounded.assert_not_awaited()
+    budget.release.assert_awaited_once()
+
+
+async def test_chat_lock_wait_renews_lease_before_execution(env):
+    """A legacy RPC stalling the shared chat lock must not expire the lease mid-queue."""
+    e, clock, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+    job = e.claim_job("chat")
+    transport = object.__new__(TelegramTransport)
+    transport.engine = e
+    transport._operation_locks = WeakValueDictionary()
+    transport._chat_operation_locks = WeakValueDictionary()
+    budget = SimpleNamespace(release=AsyncMock())
+    transport._operation_semaphore = SimpleNamespace(acquire=AsyncMock(return_value=budget), release=AsyncMock())
+
+    async def bounded(current_job):
+        assert (
+            e.db.scalar("SELECT lease_until FROM dispatch_jobs WHERE id=?", (job["id"],)) > clock()
+        ), "lease expired before the network phase"
+        return Result(1)
+
+    transport._execute_bounded = bounded
+    chat_lock = transport._chat_operation_locks.setdefault(job["chat_pool_id"], asyncio.Lock())
+    await chat_lock.acquire()
+
+    async def holder():
+        # Simulates a legacy RPC stalling the shared lock beyond the claim lease.
+        await asyncio.sleep(0.05)
+        clock.advance(200)
+        chat_lock.release()
+
+    holder_task = asyncio.create_task(holder())
+    try:
+        await asyncio.wait_for(transport.execute(job), 5)
+    finally:
+        await asyncio.gather(holder_task, return_exceptions=True)
+    e.recover_expired()
+    assert e.db.scalar("SELECT status FROM dispatch_jobs WHERE id=?", (job["id"],)) == "INFLIGHT"
+
+
+async def test_execute_phase_db_failure_requeues_unsent_job(env):
+    """A database hiccup during execute() must not file a provably-unsent job as UNKNOWN."""
+    import sqlite3
+
+    e, _, _, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    e.tick()
+
+    class Flaky(FakeTransport):
+        async def execute(self, job):
+            job["_request_may_have_been_sent"] = False
+            raise sqlite3.OperationalError("database is locked")
+
+    assert await e.run_one(Flaky()) is True
+    assert e.db.scalar("SELECT status FROM dispatch_jobs") == "PENDING"
+
+
+def test_flood_rest_is_configured_and_bounded():
+    from app.legacy.original_mailing import _flood_rest
+
+    for _ in range(50):
+        assert 600 <= _flood_rest() <= 900
+
+
+def test_media_dir_is_anchored_to_database_location(env):
+    from pathlib import Path
+
+    e, _, _, _ = env
+    assert e.config.media_dir == Path(e.config.database_path).resolve().parent / "media"
+
+
+async def test_channel_cleanup_database_methods_roundtrip(env):
+    from app.legacy.mailing_database import LegacyMailingDatabase
+
+    e, _, _, _ = env
+    _, pair, a, _, chats = setup_pair(e, 1)
+    db = LegacyMailingDatabase(e)
+    protected = await db.channel_cleanup_protected(a)
+    assigned_chat_id = e.db.scalar("SELECT chat_id FROM chat_pool WHERE id=?", (chats[0],))
+    assert assigned_chat_id in protected  # the assigned mailing chat must never be left
+    assert await db.get_sponsor_joins(a) == []
+    await db.add_sponsor_joins(a, [-100999])
+    assert await db.get_sponsor_joins(a) == [-100999]
+    await db.remove_sponsor_joins(a, [-100999])
+    assert await db.get_sponsor_joins(a) == []

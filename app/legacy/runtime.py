@@ -366,7 +366,9 @@ class LegacyRuntime:
             if name in DELIVERY_METHODS:
                 fields += ("message_cursor", "delivery_seq", "next_index")
             progress = {key: target[key] for key in fields}
-        for key, item in () if target else self.service._dialog_progress.items():
+        # This runs in the executor thread while the loop mutates _dialog_progress:
+        # iterate a snapshot, never the live dict.
+        for key, item in list(() if target else self.service._dialog_progress.items()):
             if account_id in (item["a"], item["b"]):
                 progress = {"dialog": key, "script": item["script"], "pos": item["pos"]}
                 break
@@ -576,41 +578,47 @@ class LegacyRuntime:
                 self.service.groups._spawn(self.service.groups.cleanup_clientless())
                 self.service.groups._spawn(self.service.groups.rehide_all())
             while True:
-                self.prune_clients()
-                active = {item.id for item in await self.mailing.db.get_active_mailings()}
-                for pair_id, task in list(self.mailing._tasks.items()):
-                    if pair_id not in active:
-                        busy = await self.engine.db.run(
-                            self.engine.db.scalar,
-                            "SELECT count(*) FROM legacy_rpc_journal WHERE status='INFLIGHT' AND account_id IN (SELECT account_a_id FROM pairs WHERE id=? UNION SELECT account_b_id FROM pairs WHERE id=?)",
-                            (pair_id, pair_id),
+                try:
+                    self.prune_clients()
+                    active = {item.id for item in await self.mailing.db.get_active_mailings()}
+                    for pair_id, task in list(self.mailing._tasks.items()):
+                        if pair_id not in active:
+                            busy = await self.engine.db.run(
+                                self.engine.db.scalar,
+                                "SELECT count(*) FROM legacy_rpc_journal WHERE status='INFLIGHT' AND account_id IN (SELECT account_a_id FROM pairs WHERE id=? UNION SELECT account_b_id FROM pairs WHERE id=?)",
+                                (pair_id, pair_id),
+                            )
+                            if busy:
+                                continue
+                            if not task.done():
+                                task.cancel()
+                                await asyncio.gather(task, return_exceptions=True)
+                            self.mailing._tasks.pop(pair_id, None)
+                            self.mailing._mailing_locks.pop(pair_id, None)
+                            self.mailing._stagger_until.pop(pair_id, None)
+                    if time.monotonic() - self._pruned_at > 600:
+                        ids_live = await self.engine.db.run(
+                            self.engine.db.all, "SELECT id FROM pair_chats WHERE removed_at IS NULL"
                         )
-                        if busy:
-                            continue
-                        if not task.done():
-                            task.cancel()
-                            await asyncio.gather(task, return_exceptions=True)
-                        self.mailing._tasks.pop(pair_id, None)
-                        self.mailing._mailing_locks.pop(pair_id, None)
-                        self.mailing._stagger_until.pop(pair_id, None)
-                if time.monotonic() - self._pruned_at > 600:
-                    ids_live = await self.engine.db.run(
-                        self.engine.db.all, "SELECT id FROM pair_chats WHERE removed_at IS NULL"
-                    )
-                    self.mailing._no_hello.intersection_update(row["id"] for row in ids_live)
-                    self._pruned_at = time.monotonic()
-                for pair_id in active:
-                    await self.mailing._start_mailing_task(pair_id)
-                await self.engine.db.run(self.engine.recover_legacy_operations)
-                ids = await self.database.get_enabled_warmup_account_ids()
-                batch = [aid for aid in ids if aid > self._cursor][:16] or ids[:16]
-                for account_id in batch:
-                    try:
-                        await self.service._process_account(account_id)
-                    except Exception as exc:
-                        await self.engine.db.run(self.engine.diagnostic, "legacy-warmup", exc, account_id=account_id)
-                    self._cursor = account_id
-                await self.service._save_state()
+                        self.mailing._no_hello.intersection_update(row["id"] for row in ids_live)
+                        self._pruned_at = time.monotonic()
+                    for pair_id in active:
+                        await self.mailing._start_mailing_task(pair_id)
+                    await self.engine.db.run(self.engine.recover_legacy_operations)
+                    ids = await self.database.get_enabled_warmup_account_ids()
+                    batch = [aid for aid in ids if aid > self._cursor][:16] or ids[:16]
+                    for account_id in batch:
+                        try:
+                            await self.service._process_account(account_id)
+                        except Exception as exc:
+                            await self.engine.db.run(self.engine.diagnostic, "legacy-warmup", exc, account_id=account_id)
+                        self._cursor = account_id
+                    await self.service._save_state()
+                except Exception as exc:
+                    # One bad iteration (disk error, data-shaped failure) must
+                    # not kill the orchestrator and with it the whole process:
+                    # every other long-lived loop guards per iteration.
+                    await self.engine.db.run(self.engine.diagnostic, "legacy-runtime", exc)
                 await asyncio.sleep(self.engine.config.worker_interval)
         finally:
             await self.close()

@@ -8,6 +8,9 @@ class LegacyConfig:
     DEBUG_PHONE = ""
     MAILING_DEBUG = False
     MIN_SAFE_SECONDS_PER_TARGET = 3
+    # Random extra rest after a mailing FloodWait, used by _flood_rest().
+    FLOOD_REST_MIN_SECONDS = 600
+    FLOOD_REST_MAX_SECONDS = 900
 
     def __getattr__(self, name):
         engine = engine_context.get()

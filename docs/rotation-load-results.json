@@ -3,7 +3,7 @@
   "chats": 10000,
   "exchange_plans": 250,
   "account_chat_preparations": 20000,
-  "largest_planning_cycle_seconds": 0.8064,
+  "largest_planning_cycle_seconds": 0.6424,
   "pending_jobs": 10000,
   "queue_capacity": 10000,
   "processing": {
@@ -11,19 +11,18 @@
     "duplicates": 0,
     "max_concurrency": 3,
     "restart_performed": true,
-    "wall_seconds": 6.0247,
-    "cpu_seconds": 1.8906
+    "wall_seconds": 5.5352,
+    "cpu_seconds": 3.3125
   },
   "confirmed_kinds": {
-    "MAILING": 1,
-    "ROTATION_JOIN": 399
+    "ROTATION_JOIN": 400
   },
   "sqlite_integrity": "ok",
   "sqlite_fk_errors": 0,
   "memory": {
-    "rss_mb": 32.68,
-    "process_peak_rss_mb": 33.81
+    "rss_mb": 34.35,
+    "process_peak_rss_mb": 34.35
   },
   "real_telegram_operations": 0,
-  "app_version": "2.1.0"
+  "app_version": "2.2.3"
 }

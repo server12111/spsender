@@ -27,10 +27,11 @@ def shorten(text, limit):
     return text.encode("utf-16-le")[: limit * 2].decode("utf-16-le", errors="ignore")
 
 
-async def send_view(bot, chat_id, view):
+async def send_view(bot, chat_id, view, media_dir=None):
     if view.media:
         path = Path(view.media).resolve()
-        if not path.is_relative_to(Path("data/media").resolve()) or not path.is_file():
+        root = Path(media_dir).resolve() if media_dir else Path("data/media").resolve()
+        if not path.is_relative_to(root) or not path.is_file():
             raise DomainError("Медиа недоступно")
         options = dict(chat_id=chat_id, caption=shorten(view.text, 1024), reply_markup=markup(view))
         if view.media_kind == "photo":
@@ -41,7 +42,7 @@ async def send_view(bot, chat_id, view):
     return await bot.send_message(chat_id, shorten(view.text, 4096), reply_markup=markup(view))
 
 
-async def update_view(bot, message, view):
+async def update_view(bot, message, view, media_dir=None):
     # Keep navigation in place; media previews remain separate messages.
     if getattr(message, "text", None) is not None and not view.media:
         try:
@@ -64,7 +65,7 @@ async def update_view(bot, message, view):
                 )
             ):
                 raise
-    return await send_view(bot, message.chat.id, view)
+    return await send_view(bot, message.chat.id, view, media_dir)
 
 
 def register_message(ui, user, message_id):
@@ -92,7 +93,7 @@ def make_dispatcher(ui):
         await ui.e.db.run(ui.clear, message.from_user.id)
         if ui.auth:
             await ui.auth.cancel(message.from_user.id)
-        await send_view(message.bot, message.chat.id, await ui.e.db.run(ui.main, message.from_user.id))
+        await send_view(message.bot, message.chat.id, await ui.e.db.run(ui.main, message.from_user.id), ui.e.config.media_dir)
 
     @router.callback_query()
     async def callback(query: CallbackQuery):
@@ -115,7 +116,7 @@ def make_dispatcher(ui):
                     str(exc)[:180] if isinstance(exc, (DomainError, PermissionError)) else "Проверьте введённые данные"
                 )
                 view = View(text, await ui.e.db.run(ui.nav, query.from_user.id))
-            await update_view(query.bot, query.message, view)
+            await update_view(query.bot, query.message, view, ui.e.config.media_dir)
         except Exception as exc:
             await ui.e.db.run(ui.e.diagnostic, "UI", exc)
             try:
@@ -163,7 +164,7 @@ def make_dispatcher(ui):
                 buffer = io.BytesIO()
                 await message.bot.download(document, destination=buffer)
                 view = await ui.import_account(user, document.file_name or "", buffer.getvalue())
-                await send_view(message.bot, message.chat.id, view)
+                await send_view(message.bot, message.chat.id, view, ui.e.config.media_dir)
                 return
             if state and state["state"] == "import_chats" and document:
                 if not (document.file_name or "").lower().endswith(".txt") or (document.file_size or 0) > 1024 * 1024:
@@ -183,7 +184,7 @@ def make_dispatcher(ui):
                 if (media.file_size or 0) > 20 * 1024 * 1024:
                     raise DomainError("Медиа не должно превышать 20 МБ")
                 extension = {"photo": ".jpg", "video": ".mp4", "document": ".bin"}[kind]
-                path = Path("data/media") / (uuid4().hex + extension)
+                path = ui.e.config.media_dir / (uuid4().hex + extension)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 await message.bot.download(media, destination=path)
                 template = {"text": text, "media_path": str(path.resolve()), "media_kind": kind}
@@ -204,7 +205,7 @@ def make_dispatcher(ui):
                     await message.delete()
                 except Exception:
                     pass
-        await send_view(message.bot, message.chat.id, view)
+        await send_view(message.bot, message.chat.id, view, ui.e.config.media_dir)
 
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
@@ -340,7 +341,7 @@ class BotNotificationSink:
 
     async def send(self, admin_id, kind, payload):
         view = await self.ui.e.db.run(self.build_view, admin_id, kind, payload)
-        await send_view(self.bot, admin_id, view)
+        await send_view(self.bot, admin_id, view, self.ui.e.config.media_dir)
 
 
 async def serve(engine, transport, worker_only=False):
@@ -401,7 +402,12 @@ async def serve(engine, transport, worker_only=False):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         for admin_id in list(auth.pending):
-            await auth.cancel(admin_id)
+            # One failed pending-auth cleanup must not leak every remaining
+            # client and the bot session: keep closing the rest regardless.
+            try:
+                await auth.cancel(admin_id)
+            except Exception as exc:
+                await engine.db.run(engine.diagnostic, "authorization-cancel", exc)
         try:
             await asyncio.wait_for(transport.close(), 10)
         except Exception as exc:

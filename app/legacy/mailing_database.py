@@ -7,12 +7,20 @@ from pathlib import Path
 
 from app.services.pairs import active_count, shift_role
 
+from .clock import engine_context
 from .database import LegacyDatabase
 from .models import Mailing, MailingMessage, MailingTarget
 
 
 def is_safe_media_path(path):
-    return bool(path) and Path(path).resolve().is_relative_to(Path("data/media").resolve())
+    if not path:
+        return False
+    engine = engine_context.get()
+    root = engine.config.media_dir if engine is not None else Path("data/media").resolve()
+    try:
+        return Path(path).resolve().is_relative_to(root)
+    except (OSError, ValueError):
+        return False
 
 
 def offload(function):
@@ -270,3 +278,59 @@ class LegacyMailingDatabase(LegacyDatabase):
                     )
 
         await self.engine.db.run(write)
+
+    @offload
+    def channel_cleanup_protected(self, account_id):
+        """Identifiers channel_cleanup must never leave: mailing targets of the
+        account's pairs, the warmup groups it joined, and the warmup pool."""
+        protected = []
+        with self.engine.db.read() as connection:
+            for row in connection.execute(
+                "SELECT cp.chat_id,cp.title,cp.link FROM pair_chats pc JOIN pairs p ON p.id=pc.pair_id "
+                "JOIN chat_pool cp ON cp.id=pc.chat_pool_id WHERE pc.removed_at IS NULL "
+                "AND ? IN (p.account_a_id,p.account_b_id)",
+                (account_id,),
+            ).fetchall():
+                protected.extend({row["chat_id"], row["title"], row["link"]})
+            # Warmup group tables are created lazily by the runtime, not by
+            # migrations — skip them until they exist.
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='warmup_groups'"
+            ).fetchone():
+                for row in connection.execute(
+                    "SELECT g.chat_id,g.title FROM warmup_groups g JOIN warmup_group_members m ON m.group_id=g.id "
+                    "WHERE m.account_id=? AND g.is_active=1",
+                    (account_id,),
+                ).fetchall():
+                    protected.extend({row["chat_id"], row["title"]})
+            for row in connection.execute("SELECT username FROM warmup_channels").fetchall():
+                protected.append(row["username"])
+        return protected
+
+    @offload
+    def add_sponsor_joins(self, account_id, chat_ids):
+        now = self.engine.clock()
+        with self.engine.db.tx() as connection:
+            for chat_id in chat_ids:
+                connection.execute(
+                    "INSERT OR IGNORE INTO legacy_sponsor_joins(account_id,chat_id,joined_at) VALUES (?,?,?)",
+                    (account_id, int(chat_id), now),
+                )
+
+    @offload
+    def get_sponsor_joins(self, account_id):
+        with self.engine.db.read() as connection:
+            return [
+                row["chat_id"]
+                for row in connection.execute(
+                    "SELECT chat_id FROM legacy_sponsor_joins WHERE account_id=?", (account_id,)
+                ).fetchall()
+            ]
+
+    @offload
+    def remove_sponsor_joins(self, account_id, chat_ids):
+        with self.engine.db.tx() as connection:
+            for chat_id in chat_ids:
+                connection.execute(
+                    "DELETE FROM legacy_sponsor_joins WHERE account_id=? AND chat_id=?", (account_id, int(chat_id))
+                )

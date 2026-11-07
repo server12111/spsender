@@ -102,7 +102,10 @@ async def test_native_preflight_has_its_own_deadline_and_never_starts_delivery(e
         assert error.value.category == "transient" and error.value.code == "PREFLIGHT_TIMEOUT"
         assert not native.sent and not e.db.scalar("SELECT count(*) FROM legacy_rpc_journal")
         assert runtime.transport._operation_semaphore.active == 0
-        monkeypatch.setattr(native, phase, original)
+        # Undo restores BOTH the stalled phase and the 0.02 s preflight deadline:
+        # the recovery send must run with the real 30 s deadline, otherwise a
+        # loaded machine intermittently times out its own preflight.
+        monkeypatch.undo()
         await runtime.mailing._send_msg(
             await runtime.get_client(a), target.chat_identifier, message, None, account_id=a, target_snapshot=target
         )

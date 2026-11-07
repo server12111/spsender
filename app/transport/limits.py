@@ -14,6 +14,13 @@ class RPCBudget:
         self.admitted = 0
         self.pause_until = 0
 
+    async def acquire(self):
+        """Explicit admission entry so callers can bound the queueing phase."""
+        return await self.__aenter__()
+
+    async def release(self):
+        await self.__aexit__(None, None, None)
+
     async def __aenter__(self):
         while True:
             options = await self.engine.db.run(self.engine.runtime_options)

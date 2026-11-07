@@ -628,17 +628,24 @@ class MailingService:
     async def _flush_last_sent_loop(self):
         n = 0
         while self._running:
-            await asyncio.sleep(_LAST_SENT_FLUSH_INTERVAL_SECONDS)
-            await self._flush_last_sent()
-            n += 1
-            if n % 20 == 0:  # ~once a minute
-                await self._save_state()
-                await self.db.flush_mailing_stats()
-            if n % 28800 == 1:  # at start, then ~once a day
-                try:
-                    await self.db.prune_mailing_stats()
-                except Exception as e:
-                    logger.warning(f"Mailing stats prune failed: {e}")
+            try:
+                await asyncio.sleep(_LAST_SENT_FLUSH_INTERVAL_SECONDS)
+                await self._flush_last_sent()
+                n += 1
+                if n % 20 == 0:  # ~once a minute
+                    await self._save_state()
+                    await self.db.flush_mailing_stats()
+                if n % 28800 == 1:  # at start, then ~once a day
+                    try:
+                        await self.db.prune_mailing_stats()
+                    except Exception as e:
+                        logger.warning(f"Mailing stats prune failed: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # One bad iteration must not kill persistence of rejoin
+                # cooldowns, ban backoff and ToS pauses for the rest of the run.
+                logger.warning(f"Mailing bookkeeping flush failed: {type(e).__name__}: {e}")
 
     async def _save_state(self):
         """Persist cooldowns that used to reset on every restart."""
@@ -869,6 +876,9 @@ class MailingService:
         self._stagger_until.pop(mailing_id, None)
         self._working_targets.pop(mailing_id, None)
         self._message_rotation.pop(mailing_id, None)
+        # A stale entry would pin a GuardedClient (and its raw Telethon client)
+        # past teardown; the mailing is stopped, so its spam context is dead.
+        self._spam_ctx.pop(mailing_id, None)
 
     async def stop_user_mailings(self, user_id: int):
         """Stop all active mailings for a user (called when subscription expires)."""
@@ -2845,6 +2855,9 @@ class MailingService:
             # forum before joining; now that we're in, record it so the
             # targets list flags it as a chat with topics.
             joined_chats = getattr(joined, "chats", None) or []
+            # Remember sponsor channels the bot joined itself: channel_cleanup
+            # frees these first when the account hits the 500-channel limit.
+            channel_cleanup.record_join(self.db, account_id, joined, client=client, ref=str(target))
             if joined_chats and getattr(joined_chats[0], "forum", False) and not target_obj.is_forum:
                 try:
                     await self.db.update_target_is_forum(target_obj.id, True)

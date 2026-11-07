@@ -90,8 +90,8 @@ async def test_broadcast_posts_keep_working_without_conversation_typing(env):
 async def test_typing_also_precedes_media_with_caption(env, tmp_path, monkeypatch):
     e, _, _, _ = env
     monkeypatch.chdir(tmp_path)
-    path = tmp_path / "data/media/test.bin"
-    path.parent.mkdir(parents=True)
+    path = e.config.media_dir / "test.bin"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"fake-media")
     client = LocalClient()
     adapter = adapter_for(e, client, guard=False)

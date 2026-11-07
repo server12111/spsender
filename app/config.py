@@ -7,6 +7,17 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 
+def _env_number(kind, name, default):
+    """Blank .env values fall back to the default; bad values name the variable."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return kind(raw.strip())
+    except ValueError:
+        raise ValueError(f"{name}: ожидалось число, получено {raw.strip()!r}") from None
+
+
 @dataclass(frozen=True)
 class Config:
     database_path: str = "data/fe_autosender.sqlite3"
@@ -71,10 +82,10 @@ class Config:
             session_key=os.getenv("SESSION_KEY", ""),
             api_id=int(os.getenv("TELEGRAM_API_ID") or 0),
             api_hash=os.getenv("TELEGRAM_API_HASH", ""),
-            worker_interval=float(os.getenv("WORKER_INTERVAL", "2")),
-            join_pause=int(os.getenv("JOIN_PAUSE_SECONDS", "75")),
+            worker_interval=_env_number(float, "WORKER_INTERVAL", 2),
+            join_pause=_env_number(int, "JOIN_PAUSE_SECONDS", 75),
             **{
-                key: int(os.getenv(key.upper(), str(default)))
+                key: _env_number(int, key.upper(), default)
                 for key, default in {
                     "batch_size": 32,
                     "concurrency": 4,
@@ -88,7 +99,7 @@ class Config:
                 }.items()
             },
             **{
-                key: float(os.getenv(key.upper(), str(default)))
+                key: _env_number(float, key.upper(), default)
                 for key, default in {"batch_interval": 0.25, "retry_base": 5, "retry_max": 300}.items()
             },
         )
@@ -105,3 +116,8 @@ class Config:
         if self.mode == "live" and (not self.api_id or not self.api_hash):
             raise ValueError("Для live нужны TELEGRAM_API_ID и TELEGRAM_API_HASH")
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def media_dir(self) -> Path:
+        """Media lives next to the database, so uploads stay valid regardless of CWD."""
+        return Path(self.database_path).resolve().parent / "media"

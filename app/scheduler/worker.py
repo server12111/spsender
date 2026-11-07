@@ -74,13 +74,16 @@ class Worker:
                 completed += 1
 
         tasks = [asyncio.create_task(consumer()) for _ in range(min(options["concurrency"], remaining))]
+        # Settle every sibling before surfacing a failure: re-raising early would
+        # cancel consumers mid-send and turn their jobs into spurious UNKNOWN.
         try:
-            await asyncio.gather(*tasks)
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
             await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                raise result
         return completed
 
     async def run(self):

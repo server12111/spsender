@@ -25,6 +25,10 @@ MANUAL_VERIFICATION = re.compile(
     r"captcha|капч\w*|я\s+не\s+робот|verify.*human|подтверд\w*.*человек|пройд\w*.*проверк", re.I
 )
 
+# Admission queueing must stay shorter than the 180 s claim lease so a job can
+# never be marked WORKER_LOST while its worker is still alive.
+ADMISSION_WAIT = 150
+
 
 def classify_error(exc):
     if isinstance(exc, OperationError):
@@ -170,6 +174,20 @@ class TelegramTransport:
                 session = self.engine.secrets.decrypt(account["encrypted_session"])
                 client = self.new_client(session)
                 await asyncio.wait_for(client.connect(), 30)
+
+                @client.on(events.NewMessage(incoming=True))
+                async def on_message(event):
+                    try:
+                        self._incoming.put_nowait((account_id, event))
+                    except asyncio.QueueFull:
+                        self._incoming_dropped += 1
+                        # Bound memory under input overload. Consumer reports the dropped
+                        # count through diagnostics; it never starts unchecked replies.
+                        if self._incoming_dropped == 1:
+                            logging.getLogger("fe_autosender").error("INCOMING_OVERLOAD account_id=%s", account_id)
+
+                # Registered before any awaited setup so updates arriving during
+                # authorization and DB writes are queued, not dropped.
                 if not await asyncio.wait_for(client.is_user_authorized(), 30):
                     raise OperationError("critical", "SESSION_EXPIRED")
             except BaseException as exc:
@@ -201,17 +219,6 @@ class TelegramTransport:
             self.clients[account_id] = client
             self._client_sessions[account_id] = account["encrypted_session"]
             self._start_incoming()
-
-            @client.on(events.NewMessage(incoming=True))
-            async def on_message(event):
-                try:
-                    self._incoming.put_nowait((account_id, event))
-                except asyncio.QueueFull:
-                    self._incoming_dropped += 1
-                    # Bound memory under input overload. Consumer reports the dropped
-                    # count through diagnostics; it never starts unchecked replies.
-                    if self._incoming_dropped == 1:
-                        logging.getLogger("fe_autosender").error("INCOMING_OVERLOAD account_id=%s", account_id)
 
             return client
 
@@ -354,13 +361,19 @@ class TelegramTransport:
 
         async def retire(account_id):
             async with retirement_slots:
-                client = self.clients.get(account_id)
-                if client is None:
-                    return
-                try:
-                    await self._disconnect_client(account_id, client)
-                except Exception as exc:
-                    await self.engine.db.run(self.engine.diagnostic, "disconnect", exc, account_id=account_id)
+                # Never disconnect a client out from under an in-flight job:
+                # the per-account operation lock covers the whole execute().
+                locks = getattr(self, "_operation_locks", None)
+                if locks is None:
+                    locks = self._operation_locks = WeakValueDictionary()
+                async with locks.setdefault(account_id, asyncio.Lock()):
+                    client = self.clients.get(account_id)
+                    if client is None:
+                        return
+                    try:
+                        await self._disconnect_client(account_id, client)
+                    except Exception as exc:
+                        await self.engine.db.run(self.engine.diagnostic, "disconnect", exc, account_id=account_id)
 
         await asyncio.gather(*(retire(account_id) for account_id in retired_batch))
         if retired_batch:
@@ -392,14 +405,40 @@ class TelegramTransport:
         await asyncio.gather(*(connect(a) for a in chosen))
 
     async def execute(self, job):
+        # Publish the not-sent protocol from the very first await: cancellation
+        # during queueing or admission provably never reached the network.
+        job["_request_may_have_been_sent"] = False
         if hasattr(self, "_operation_semaphore"):
             lock = self._operation_locks.setdefault(job["account_id"], asyncio.Lock())
-            async with self._operation_semaphore, lock:
-                if job.get("chat_pool_id") is not None:
-                    chat_lock = self._chat_operation_locks.setdefault(job["chat_pool_id"], asyncio.Lock())
-                    async with chat_lock:
-                        return await self._execute_bounded(job)
-                return await self._execute_bounded(job)
+            # Queueing is legal, but the 180 s claim lease must never expire
+            # while the worker is alive: cap the admission phase and refresh
+            # the lease at every await boundary that can outlive it.
+            try:
+                budget = await asyncio.wait_for(self._operation_semaphore.acquire(), ADMISSION_WAIT)
+            except asyncio.TimeoutError:
+                raise OperationError("cancelled", "CANCELLED_BEFORE_REQUEST") from None
+            try:
+                if not await self.engine.db.run(self.engine.renew_job_lease, job):
+                    raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
+                async with lock:
+                    if not await self.engine.db.run(self.engine.renew_job_lease, job):
+                        raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
+                    if job.get("chat_pool_id") is not None:
+                        chat_lock = self._chat_operation_locks.setdefault(job["chat_pool_id"], asyncio.Lock())
+                        async with chat_lock:
+                            # Legacy RPCs share this lock and can outlast the
+                            # remaining lease: renew again before the send.
+                            if not await self.engine.db.run(self.engine.renew_job_lease, job):
+                                raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
+                            return await self._execute_bounded(job)
+                    return await self._execute_bounded(job)
+            finally:
+                try:
+                    await budget.release()
+                except asyncio.CancelledError:
+                    # The budget releases under shield internally; a shutdown
+                    # cancel must not replace the in-flight exception.
+                    pass
         return await self._execute_bounded(job)
 
     async def _execute_bounded(self, job):
@@ -480,7 +519,7 @@ class TelegramTransport:
             sticker = random.choice(choices)
         if media:
             path = Path(media).resolve()
-            root = Path("data/media").resolve()
+            root = self.engine.config.media_dir
             if not path.is_relative_to(root) or not path.is_file():
                 raise OperationError("configuration", "MEDIA_UNAVAILABLE")
         await self.guard(job)
@@ -687,10 +726,12 @@ class TelegramTransport:
             # Also retain half-created clients when connection cleanup fails.
             self.clients.setdefault(account_id, client)
             raise
+        finally:
+            # One failed disconnect must not permanently block client reuse.
+            self._retiring.discard(account_id)
         if self.clients.get(account_id) is client:
             self.clients.pop(account_id, None)
             self._client_sessions.pop(account_id, None)
-        self._retiring.discard(account_id)
 
     async def close(self):
         self._closing = True

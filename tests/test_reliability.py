@@ -300,10 +300,8 @@ async def test_real_adapter_payload_with_local_fake_client(env, tmp_path, monkey
     monkeypatch.chdir(tmp_path)
     template = {"text": "Сообщение"}
     if kind:
-        from pathlib import Path
-
-        path = Path("data/media/test.bin")
-        path.parent.mkdir(parents=True)
+        path = e.config.media_dir / "test.bin"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"mock-media")
         template.update(media_path=str(path.resolve()), media_kind=kind)
     e.edit_campaign(ca, "mailing", [template])

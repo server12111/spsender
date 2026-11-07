@@ -1,6 +1,9 @@
 import asyncio
 import json
+import logging
 import random
+
+from app.async_tools import settle_cancelled
 
 from .core import DomainError, dump, row, rows
 from .pairs import active_count, shift_role
@@ -34,7 +37,7 @@ class Dispatch:
         if existing:
             if existing["status"] == "CANCELLED":
                 c.execute(
-                    "UPDATE dispatch_jobs SET status='PENDING',account_id=?,payload=?,version=?,planned_at=?,current_attempt_id=NULL,retry_count=0,lease_owner=NULL,lease_until=NULL,last_error=NULL WHERE id=?",
+                    "UPDATE dispatch_jobs SET status='PENDING',account_id=?,payload=?,version=?,planned_at=?,current_attempt_id=NULL,retry_count=0,lease_owner=NULL,lease_until=NULL,last_error=NULL,completed_at=NULL WHERE id=?",
                     (account_id, dump(payload), campaign["version"], planned_at or self.clock(), existing["id"]),
                 )
                 return existing["id"]
@@ -181,15 +184,27 @@ class Dispatch:
                     continue
                 pending_before = row(c, "SELECT value FROM queue_counters WHERE name='pending'")["value"]
                 campaign = self.campaign(c, pair["campaign_id"])
-                self._plan_memberships(c, pair, campaign)
-                self._onboard(c, pair, campaign)
-                pair = self._pair(c, pair["id"])
-                self._sync_pair(c, pair)
-                pair = self._pair(c, pair["id"])
-                self._plan_dm_sequences(c, pair, campaign)
-                self._plan_group_replies(c, pair, campaign)
-                self._plan_rotation_pair(c, pair, campaign)
-                self._plan_dispatch(c, pair, campaign)
+                try:
+                    self._plan_memberships(c, pair, campaign)
+                    self._onboard(c, pair, campaign)
+                    pair = self._pair(c, pair["id"])
+                    self._sync_pair(c, pair)
+                    pair = self._pair(c, pair["id"])
+                    self._plan_dm_sequences(c, pair, campaign)
+                    self._plan_group_replies(c, pair, campaign)
+                    self._plan_rotation_pair(c, pair, campaign)
+                    self._plan_dispatch(c, pair, campaign)
+                except Exception as exc:
+                    # A poison pair must not wedge planning of every later pair:
+                    # log the failure class and still advance the cursor past it.
+                    code = type(exc).__name__
+                    logging.getLogger("fe_autosender").warning(
+                        "planner error=%s context=%s", code, dump({"pair_id": selected_pair["id"]})
+                    )
+                    c.execute(
+                        "INSERT INTO service_diagnostics(component,error_code,created_at,detail) VALUES (?,?,?,?)",
+                        ("planner", code, self.clock(), dump({"pair_id": selected_pair["id"]})),
+                    )
                 c.execute(
                     "INSERT INTO settings VALUES ('planner_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(pair["id"]),),
@@ -468,7 +483,7 @@ class Dispatch:
                         )
                 if job["chat_pool_id"] is not None:
                     c.execute(
-                        "UPDATE pair_chats SET last_sent_at=?,cooldown_until=?,last_result='CONFIRMED',last_error=NULL "
+                        "UPDATE pair_chats SET last_sent_at=?,cooldown_until=MAX(cooldown_until,?),last_result='CONFIRMED',last_error=NULL "
                         "WHERE id=(SELECT id FROM pair_chats WHERE pair_id=? AND chat_pool_id=? ORDER BY id DESC LIMIT 1)",
                         (now, now + campaign["interval_seconds"], job["pair_id"], job["chat_pool_id"]),
                     )
@@ -534,7 +549,7 @@ class Dispatch:
             elif error.category == "flood":
                 self._flood_wait(c, job["account_id"], error.seconds)
                 c.execute(
-                    "UPDATE dispatch_jobs SET status='PENDING',planned_at=?,retry_count=retry_count+1 WHERE id=?",
+                    "UPDATE dispatch_jobs SET status='PENDING',planned_at=?,retry_count=retry_count+1,completed_at=NULL WHERE id=?",
                     (self.clock() + max(1, error.seconds), job["id"]),
                 )
                 maximum = int(row(c, "SELECT value FROM settings WHERE key='max_retries'")["value"])
@@ -551,7 +566,7 @@ class Dispatch:
                 if retry <= int(options["max_retries"]):
                     delay = min(float(options["retry_max"]), float(options["retry_base"]) * 2 ** (retry - 1))
                     c.execute(
-                        "UPDATE dispatch_jobs SET status='PENDING',retry_count=?,planned_at=?,dispatch_order=? WHERE id=?",
+                        "UPDATE dispatch_jobs SET status='PENDING',retry_count=?,planned_at=?,dispatch_order=?,completed_at=NULL WHERE id=?",
                         (retry, self.clock() + delay, self.clock(), job["id"]),
                     )
                 else:
@@ -632,6 +647,16 @@ class Dispatch:
                 error=error.code,
             )
 
+    def renew_job_lease(self, job):
+        """Admission may legally queue; refresh the claim while this consumer provably owns it."""
+        with self.db.tx() as c:
+            renewed = c.execute(
+                "UPDATE dispatch_jobs SET lease_until=? WHERE id=? AND status='INFLIGHT' "
+                "AND lease_owner=? AND current_attempt_id=?",
+                (self.clock() + 180, job["id"], job["lease_owner"], job["attempt_id"]),
+            ).rowcount
+        return bool(renewed)
+
     def recover_expired(self):
         with self.db.tx() as c:
             for job in rows(
@@ -667,31 +692,58 @@ class Dispatch:
                 self.audit(c, "UNKNOWN_NOT_SENT", campaign_id=job["campaign_id"], job_id=job_id)
 
     async def run_one(self, transport, owner="worker", emergency_sink=None):
+        from app.transport.base import OperationError
+
         # Retain the claim result if shutdown arrives while its transaction commits.
         claim = asyncio.create_task(self.db.run(self.claim_job, owner))
         try:
             job = await asyncio.shield(claim)
         except asyncio.CancelledError:
-            from app.transport.base import OperationError
-
-            job = await claim
-            if job:
-                await self.db.run(self.fail_job, job, OperationError("cancelled", "CANCELLED_BEFORE_REQUEST"))
+            await settle_cancelled(claim)
+            if claim.done() and not claim.cancelled() and claim.exception() is None:
+                job = claim.result()
+                if job:
+                    await self.db.run(self.fail_job, job, OperationError("cancelled", "CANCELLED_BEFORE_REQUEST"))
             raise
         if not job:
             return False
         try:
-            if not await self.db.run(self.execution_allowed, job):
-                from app.transport.base import OperationError
-
-                raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
-            result = await asyncio.wait_for(transport.execute(job), 120)
+            allowed = await self.db.run(self.execution_allowed, job)
         except asyncio.CancelledError:
-            from app.transport.base import OperationError
-
-            await self.db.run(self.fail_job, job, OperationError("unknown", "WORKER_CANCELLED"))
+            await self.db.run(self.fail_job, job, OperationError("cancelled", "CANCELLED_BEFORE_REQUEST"))
             raise
         except Exception as exc:
+            # Admission could not be verified, so nothing reached the network.
+            # Re-queue instead of UNKNOWN: a database hiccup must not wedge the
+            # pair behind a manual reconciliation prompt.
+            try:
+                await self.db.run(self.fail_job, job, OperationError("transient", type(exc).__name__))
+            except Exception as persistence_error:
+                await self._persistence_failure(job, persistence_error, type(exc).__name__, emergency_sink)
+                raise
+            return True
+        try:
+            if not allowed:
+                raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
+            # The 120 s budget lives inside transport.execute() and covers only the
+            # network phase; queueing for a busy account must not shorten it.
+            result = await transport.execute(job)
+        except asyncio.CancelledError:
+            # Only a request that may already have been sent requires manual
+            # reconciliation. Transports that publish the flag protocol prove
+            # nothing was sent yet; opaque transports stay conservative (UNKNOWN).
+            if job.get("_request_may_have_been_sent") is False:
+                await self.db.run(self.fail_job, job, OperationError("cancelled", "CANCELLED_BEFORE_REQUEST"))
+            else:
+                await self.db.run(self.fail_job, job, OperationError("unknown", "WORKER_CANCELLED"))
+            raise
+        except Exception as exc:
+            if not isinstance(exc, OperationError) and job.get("_request_may_have_been_sent") is False:
+                # A non-transport exception while the request is provably unsent
+                # (e.g. a database hiccup during admission or lease renewal) is
+                # re-queued, not filed as UNKNOWN: opaque transports that never
+                # set the flag keep the conservative UNKNOWN contract.
+                exc = OperationError("transient", type(exc).__name__)
             try:
                 await self.db.run(self.fail_job, job, exc)
             except Exception as persistence_error:
