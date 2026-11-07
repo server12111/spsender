@@ -73,8 +73,11 @@ class Config:
     @classmethod
     def load(cls):
         load_dotenv()
+        # Hosting convention: DATA_DIR names the persistent folder; DATABASE_PATH
+        # (absolute) still takes precedence when set explicitly.
+        default_database = os.path.join(os.getenv("DATA_DIR", "data"), "fe_autosender.sqlite3")
         config = cls(
-            database_path=os.getenv("DATABASE_PATH", "data/fe_autosender.sqlite3"),
+            database_path=os.getenv("DATABASE_PATH") or default_database,
             mode=os.getenv("MODE", "dry-run"),
             bot_token=os.getenv("BOT_TOKEN", ""),
             admin_ids=tuple(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()),

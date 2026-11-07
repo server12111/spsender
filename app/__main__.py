@@ -56,14 +56,16 @@ def main():
     parser = argparse.ArgumentParser(description="FE AutoSender 2.0")
     parser.add_argument("command", choices=("keygen", "migrate", "check", "smoke", "run", "worker"))
     args = parser.parse_args()
-    configure_logging()
     if args.command == "keygen":
+        configure_logging()
         print(Fernet.generate_key().decode())
         return
+    # Config first so file logs land next to the (possibly relocated) database.
+    config = Config.load()
+    configure_logging(Path(config.database_path).parent / "logs")
     if args.command == "smoke":
         asyncio.run(smoke())
         return
-    config = Config.load()
     if args.command == "migrate":
         Database(config.database_path).migrate()
         print("Миграции SQLite применены")

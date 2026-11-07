@@ -24,12 +24,13 @@ def mask_phone(phone: str) -> str:
     return "+" + "*" * max(0, len(digits) - 4) + digits[-4:]
 
 
-def configure_logging():
+def configure_logging(folder=None):
     # Library RPC errors may contain peer data. The application records only error codes.
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("telethon").setLevel(logging.CRITICAL)
     logging.getLogger("aiogram.event").setLevel(logging.CRITICAL)
-    folder = Path("data/logs")
+    # Anchor logs next to the database (persistent on hosting), not to the CWD.
+    folder = Path(folder) if folder else Path("data/logs")
     folder.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(folder, 0o700)

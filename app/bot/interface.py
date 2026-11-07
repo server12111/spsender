@@ -4,6 +4,7 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import wraps
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from app.services.core import RUNTIME_LIMITS, DomainError, dump, row
@@ -798,7 +799,11 @@ class Interface:
         text += "\n\nПоследние сбои служб:\n" + "\n".join(
             f"{self.time(r['created_at'])} · {r['component']} · {r['error_code']}" for r in logs
         )
-        text += "\n\nФайловый журнал: data/logs/diagnostics.log (ротация 3 × 5 МБ)."
+        text += (
+            "\n\nФайловый журнал: "
+            + str(Path(self.e.config.database_path).parent / "logs" / "diagnostics.log")
+            + " (ротация 3 × 5 МБ)."
+        )
         return View(text[:3900], self.nav(user, "errors"))
 
     def rotation_view(self, user, campaign_id, page=0):
