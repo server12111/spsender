@@ -1,5 +1,14 @@
--e .
-# Hosting-compat shim: the bothost.ru build template probes `import telegram`
-# for any project mentioning it. The app itself uses aiogram + Telethon and
-# never imports this package at runtime.
+# Flat dependency list for hosting builders (the bothost.ru template runs
+# pip install -r requirements.txt directly; no editable install there).
+# python-telegram-bot is a hosting-compat shim: the template probes
+# "import telegram" for any project mentioning it. The app itself uses
+# aiogram + Telethon and never imports that package at runtime.
+aiogram>=3.31,<3.32
+Telethon>=1.45,<1.46
+cryptography>=44
+python-dotenv>=1.0
+tzdata>=2025.1
+Pillow>=10
+pytz>=2024.1
+opentele-ng[pyrogram]>=1.4.0
 python-telegram-bot>=21.8,<23
