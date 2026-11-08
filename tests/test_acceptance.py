@@ -60,8 +60,7 @@ async def test_03_campaign_assignment_choices(env):
     multi, choices = e.add_account("Выбор", "+10000000002")
     assert len(choices) == 2 and not e.db.one("SELECT * FROM campaign_members WHERE account_id=?", (multi,))
     ui = Interface(e, api, AccountAuthorizer(e, api))
-    ui.set_state(123, "add_account_name")
-    await ui.message(123, "Третий")
+    ui.set_state(123, "account_phone")
     await ui.message(123, "+10000000003")
     result = await ui.message(123, "00000")
     assert "Выберите рассылку" in result.text

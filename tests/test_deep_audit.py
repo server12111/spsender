@@ -383,12 +383,12 @@ def test_import_commit_rechecks_revision_in_same_transaction(env):
     ui.import_confirmation(123, {"lines": ["@localtest"], "approved": True})
     old_revision = ui.state(123)["data"]["_revision"]
     ui.clear(123)
-    ui.set_state(123, "add_account_name")
+    ui.set_state(123, "account_phone")
     with pytest.raises(DomainError, match="отменён"):
         ui._import_chat(123, old_revision, -100000, "Local", 0, "@localtest", {"approved": True})
     assert not e.db.scalar("SELECT count(*) FROM chat_pool")
     assert ui.clear(123, old_revision) == 0
-    assert ui.state(123)["state"] == "add_account_name"
+    assert ui.state(123)["state"] == "account_phone"
 
 
 async def test_last_import_failure_does_not_clear_replacement_wizard(env):
@@ -411,10 +411,10 @@ async def test_last_import_failure_does_not_clear_replacement_wizard(env):
     task = asyncio.create_task(ui.callback(123, callback))
     await entered.wait()
     ui.clear(123)
-    ui.set_state(123, "add_account_name")
+    ui.set_state(123, "account_phone")
     release.set()
     await task
-    assert ui.state(123)["state"] == "add_account_name"
+    assert ui.state(123)["state"] == "account_phone"
 
 
 @pytest.mark.parametrize("seed", [7, 29, 71])

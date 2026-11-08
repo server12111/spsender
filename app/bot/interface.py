@@ -1416,11 +1416,19 @@ class Interface:
         if action == "add":
             if section == "campaigns":
                 return await self.e.db.run(self.wizard, user, {"step": 1, "texts": [], "accounts": []})
-            await self.e.db.run(self.set_state, user, "add_account_name" if section == "accounts" else "import_chats")
+            if section == "accounts":
+                # No name question: accounts get an automatic name from the
+                # phone number and can be renamed from the card later.
+                await self.e.db.run(self.set_state, user, "account_phone", {})
+                return View(
+                    "Добавление · Шаг 1 из 3\nВведите номер собственного аккаунта в международном формате — "
+                    "код любой страны, например +12025550123 или +380671234567. "
+                    "Пробелы, дефисы и скобки убираются автоматически.",
+                    await self.e.db.run(self.cancel, user),
+                )
+            await self.e.db.run(self.set_state, user, "import_chats")
             return View(
-                "Шаг 1 из 4\nНазвание аккаунта"
-                if section == "accounts"
-                else "Шаг 1 из 2\nОтправьте ссылки / ID по одной на строку или TXT-файл UTF-8.\nПрава публикации подтверждаются на следующем шаге.",
+                "Шаг 1 из 2\nОтправьте ссылки / ID по одной на строку или TXT-файл UTF-8.\nПрава публикации подтверждаются на следующем шаге.",
                 await self.e.db.run(self.cancel, user),
             )
         if action.startswith("wizard_"):
@@ -1814,7 +1822,10 @@ class Interface:
             await self.e.db.run(self.e.save_session, form["account_id"], session, telegram_id)
             account_id, choices = form["account_id"], []
         else:
-            account_id, choices = await self.e.db.run(self.e.add_account, form["name"], phone, session, telegram_id)
+            # The name question was removed: default to a phone-based name,
+            # renamable from the account card at any time.
+            name = (form.get("name") or "").strip() or f"Аккаунт {(phone or '0000')[-4:]}"
+            account_id, choices = await self.e.db.run(self.e.add_account, name, phone, session, telegram_id)
         await self.e.db.run(self.clear, user)
         if choices:
             return View(
@@ -1998,24 +2009,22 @@ class Interface:
             )
             await self.e.db.run(self.clear, user)
             return await self.e.db.run(self.template_list, user, form["id"], form["kind"])
-        if name == "add_account_name":
-            if not text.strip():
-                raise DomainError("Введите название")
-            await self.e.db.run(self.set_state, user, "account_phone", {"name": text.strip()[:100]})
-            return View(
-                "Добавление · Шаг 2 из 4\nВведите номер собственного аккаунта в международном формате.",
-                await self.e.db.run(self.cancel, user),
-            )
         if name == "account_phone":
             import re
 
-            if not re.fullmatch(r"\+\d{8,15}", text.strip()):
-                raise DomainError("Номер должен иметь вид +380123456789")
-            await self.auth.begin(user, text.strip())
+            # Accept any country code; spaces, dashes and parentheses (often
+            # copied from contacts) are stripped before validation.
+            normalized = re.sub(r"[\s()\u00a0\u2013\u2014-]", "", text.strip())
+            if not re.fullmatch(r"\+\d{7,15}", normalized):
+                raise DomainError(
+                    "Номер в международном формате с кодом любой страны: +12025550123 или +380671234567"
+                )
+            await self.auth.begin(user, normalized)
             # Phone is retained only inside the authorization object until it can be encrypted.
             await self.e.db.run(self.set_state, user, "account_code", form)
+            stage = "Подключение" if form.get("account_id") else "Добавление"
             return View(
-                "Подключение · Шаг 3 из 4\nВведите код подтверждения Telegram."
+                f"{stage} · Шаг 2 из 3\nВведите код подтверждения Telegram."
                 + (
                     "\nТестовый код: 00000"
                     if self.e.config.mode == "dry-run"

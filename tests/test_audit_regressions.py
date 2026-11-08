@@ -14,7 +14,7 @@ from app.bot.interface import Interface
 from app.bot.runtime import BotNotificationSink
 from app.services.core import DomainError
 from app.transport.base import FakeNotificationSink, FakeTransport, OperationError, Result
-from app.transport.telegram import TelegramTransport, classify_error
+from app.transport.telegram import AccountAuthorizer, TelegramTransport, classify_error
 
 
 def adapter(engine, client=None):
@@ -777,6 +777,27 @@ def test_unwritable_log_folder_never_stops_startup(tmp_path, monkeypatch):
         assert any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
     finally:
         logger.handlers = saved
+
+
+async def test_phone_input_accepts_any_country_and_spaces(env):
+    """Any E.164 country code with copy artifacts (spaces, dashes) is accepted."""
+    e, _, api, _ = env
+    _, _, _, _, _ = setup_pair(e, 1)
+    ui = Interface(e, api, AccountAuthorizer(e, api))
+    for phone, normalized in (
+        ("+1 202 555 01 23", "+12025550123"),  # US: spaces must be stripped
+        ("+380 (67) 123-45-67", "+380671234567"),  # UA: parens and dashes stripped
+        ("+376 12345", "+37612345"),  # shortest country codes (Andorra)
+    ):
+        ui.set_state(123, "account_phone")
+        await ui.message(123, phone)
+        assert ui.auth.pending[123]["phone"] == normalized
+    with pytest.raises(DomainError, match="международном"):
+        ui.set_state(123, "account_phone")
+        await ui.message(123, "80671234567")  # no country code
+    with pytest.raises(DomainError, match="международном"):
+        ui.set_state(123, "account_phone")
+        await ui.message(123, "+1234567890123456")  # longer than E.164 allows
 
 
 def test_media_dir_is_anchored_to_database_location(env):
