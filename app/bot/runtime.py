@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 from pathlib import Path
 from uuid import uuid4
 
@@ -112,6 +113,10 @@ def make_dispatcher(ui):
             try:
                 view = await ui.callback(query.from_user.id, query.data or "")
             except (DomainError, ValueError, PermissionError) as exc:
+                if not isinstance(exc, (DomainError, PermissionError)):
+                    # Full traceback into docker logs / diagnostics.log: without
+                    # it remote failures are undiagnosable.
+                    logging.getLogger("fe_autosender").warning("UI callback rejected", exc_info=True)
                 text = (
                     str(exc)[:180] if isinstance(exc, (DomainError, PermissionError)) else "Проверьте введённые данные"
                 )
@@ -194,9 +199,14 @@ def make_dispatcher(ui):
                 template["legacy_options"] = legacy_options
             view = await ui.message(user, text, template, txt_content)
         except (DomainError, ValueError, UnicodeError) as exc:
+            if not isinstance(exc, DomainError):
+                # Full traceback into docker logs / diagnostics.log: without it
+                # remote failures like live auth.begin are undiagnosable.
+                logging.getLogger("fe_autosender").warning("UI input rejected", exc_info=True)
             error_text = str(exc) if isinstance(exc, DomainError) else "Проверьте формат данных и повторите ввод"
             view = View(error_text, ui.cancel(user))
         except Exception as exc:
+            logging.getLogger("fe_autosender").warning("UI failure", exc_info=True)
             await ui.e.db.run(ui.e.diagnostic, "UI", exc)
             view = View("Действие не выполнено. Повторите ввод или отмените мастер.", ui.cancel(user))
         finally:

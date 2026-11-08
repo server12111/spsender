@@ -78,6 +78,10 @@ def classify_error(exc):
         return OperationError("flood", "SLOW_MODE_WAIT", max(1, exc.seconds))
     if name in {"UserIsBlockedError", "YouBlockedUserError", "UserPrivacyRestrictedError", "UserNotMutualContactError"}:
         return OperationError("recipient", "RECIPIENT_UNAVAILABLE")
+    if name in {"PhoneNumberInvalidError", "PhoneNumberBannedError", "PhoneNumberUnoccupiedError"}:
+        return OperationError("recipient", "PHONE_INVALID")
+    if name in {"PhoneNumberFloodError"}:
+        return OperationError("flood", "PHONE_FLOOD", max(60, getattr(exc, "seconds", 60)))
     if name in {"MessageTooLongError", "MediaCaptionTooLongError", "MessageEmptyError", "StickerInvalidError"}:
         return OperationError("configuration", name)
     # Timeout/connection loss may happen AFTER Telegram accepted the request.

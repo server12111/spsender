@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from app.services.core import RUNTIME_LIMITS, DomainError, dump, row
 from app.services.greetings import greeting_pool
 
-from .labels import PERIODS, SECTIONS, label
+from .labels import LABELS, PERIODS, SECTIONS, label
 
 RUNTIME_TITLES = {
     "batch_size": "Размер пакета",
@@ -2019,7 +2019,17 @@ class Interface:
                 raise DomainError(
                     "Номер в международном формате с кодом любой страны: +12025550123 или +380671234567"
                 )
-            await self.auth.begin(user, normalized)
+            try:
+                await self.auth.begin(user, normalized)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                from app.transport.telegram import classify_error
+
+                classified = classify_error(exc)
+                hint = label(classified.code) if classified.code in LABELS else ""
+                detail = f": {hint}" if hint else "; повторите позже или проверьте подключение"
+                raise DomainError(f"Код не отправлен{detail}") from None
             # Phone is retained only inside the authorization object until it can be encrypted.
             await self.e.db.run(self.set_state, user, "account_code", form)
             stage = "Подключение" if form.get("account_id") else "Добавление"
