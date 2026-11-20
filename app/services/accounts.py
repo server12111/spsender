@@ -24,8 +24,12 @@ class Accounts:
         now = self.clock()
         with self.db.tx() as c:
             candidates = rows(c, "SELECT id,name FROM campaigns WHERE status<>'REMOVED' ORDER BY id")
-            if campaign_id is None and len(candidates) == 1:
-                campaign_id = candidates[0]["id"]
+            if campaign_id is None:
+                running = rows(c, "SELECT id,name FROM campaigns WHERE status='RUNNING' ORDER BY id")
+                if running:
+                    candidates = running
+                if len(candidates) == 1:
+                    campaign_id = candidates[0]["id"]
             if telegram_id is not None and row(c, "SELECT id FROM accounts WHERE telegram_id=?", (telegram_id,)):
                 raise DomainError("Этот Telegram-аккаунт уже добавлен")
             account_id = c.execute(

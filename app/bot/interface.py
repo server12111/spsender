@@ -1920,7 +1920,16 @@ class Interface:
                 + await self.e.db.run(self.nav, user, "accounts"),
             )
         view = await self.e.db.run(self.card, user, "accounts", account_id)
-        view.text = "✅ Аккаунт сохранён · Подготовка началась\n\n" + view.text
+        notice = "✅ Аккаунт сохранён · Подготовка началась"
+        if not form.get("account_id"):
+            assigned = await self.e.db.run(
+                self.e.db.one,
+                "SELECT c.name FROM campaign_members m JOIN campaigns c ON c.id=m.campaign_id WHERE m.account_id=? AND c.status='RUNNING'",
+                (account_id,),
+            )
+            if assigned:
+                notice = f"✅ Аккаунт автоматически добавлен в рассылку «{assigned['name']}». Подготовка началась."
+        view.text = notice + "\n\n" + view.text
         return view
 
     async def _import_active(self, user, form):
