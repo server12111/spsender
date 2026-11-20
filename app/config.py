@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -83,8 +84,8 @@ class Config:
             admin_ids=tuple(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()),
             timezone=os.getenv("TIMEZONE", "Europe/Kyiv"),
             session_key=os.getenv("SESSION_KEY", ""),
-            api_id=int(os.getenv("TELEGRAM_API_ID") or 0),
-            api_hash=os.getenv("TELEGRAM_API_HASH", ""),
+            api_id=_env_number(int, "TELEGRAM_API_ID", 0),
+            api_hash=os.getenv("TELEGRAM_API_HASH", "").strip(),
             worker_interval=_env_number(float, "WORKER_INTERVAL", 2),
             join_pause=_env_number(int, "JOIN_PAUSE_SECONDS", 75),
             **{
@@ -116,9 +117,20 @@ class Config:
     def validate_bot(self):
         if not self.bot_token or not self.admin_ids or not self.session_key:
             raise ValueError("Задайте BOT_TOKEN, ADMIN_IDS и SESSION_KEY в .env")
-        if self.mode == "live" and (not self.api_id or not self.api_hash):
-            raise ValueError("Для live нужны TELEGRAM_API_ID и TELEGRAM_API_HASH")
+        if self.mode == "live":
+            self.validate_api()
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def validate_api(self):
+        if (
+            not isinstance(self.api_id, int)
+            or isinstance(self.api_id, bool)
+            or self.api_id <= 0
+            or not re.fullmatch(r"[a-fA-F0-9]{32}", self.api_hash)
+        ):
+            raise ValueError(
+                "Задайте TELEGRAM_API_ID (положительное число) и TELEGRAM_API_HASH (32 hex-символа) из одной пары API на my.telegram.org"
+            )
 
     @property
     def media_dir(self) -> Path:

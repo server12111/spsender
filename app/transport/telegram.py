@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import random
@@ -15,8 +16,10 @@ from weakref import WeakValueDictionary
 from telethon import TelegramClient, errors, events, functions, types, utils
 
 from app.services.chat_pool import parse_target
+from app.services.core import DomainError
 from app.services.memberships import CHALLENGE, membership_links, membership_prompt
 
+from .authorization import delivery_hint
 from .base import OperationError, Result
 from .limits import RPCBudget
 from .session import BoundedStringSession
@@ -760,7 +763,16 @@ def auth_serialized(function):
     async def guarded(self, admin_id, *args, **kwargs):
         self.engine.authorize(admin_id)
         async with self._locks[admin_id]:
-            return await function(self, admin_id, *args, **kwargs)
+            try:
+                return await function(self, admin_id, *args, **kwargs)
+            except errors.RPCError as exc:
+                pending = self.pending.get(admin_id, {})
+                if isinstance(exc, errors.FloodWaitError):
+                    await self.engine.db.run(self._extend_wait, "auth:api-wait", max(1, exc.seconds))
+                elif type(exc).__name__ == "PhoneNumberFloodError" and pending.get("phone"):
+                    await self.engine.db.run(self._extend_wait, self._phone_key(pending["phone"]), 3600)
+                await self.engine.db.run(self.engine.diagnostic, "authorization", exc)
+                raise
 
     return guarded
 
@@ -773,6 +785,42 @@ class AccountAuthorizer:
         self.pending = {}
         self._locks = {admin: asyncio.Lock() for admin in engine.config.admin_ids}
 
+    def _validate_api(self):
+        try:
+            self.engine.config.validate_api()
+        except ValueError as exc:
+            raise DomainError(str(exc)) from None
+
+    def _phone_key(self, phone):
+        digest = hmac.new(self.engine.config.session_key.encode(), phone.encode(), hashlib.sha256).hexdigest()
+        return "auth:phone-wait:" + digest
+
+    def _extend_wait(self, key, seconds):
+        with self.engine.db.tx() as c:
+            c.execute(
+                "INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(settings.value AS REAL),CAST(excluded.value AS REAL)) AS TEXT)",
+                (key, str(self.engine.clock() + seconds)),
+            )
+
+    def _reserve_code_request(self, phone):
+        key, now = self._phone_key(phone), self.engine.clock()
+        with self.engine.db.tx() as c:
+            for item in c.execute("SELECT value FROM settings WHERE key IN (?,?)", (key, "auth:api-wait")):
+                delay = float(item[0]) - now
+                if delay > 0:
+                    raise DomainError(
+                        f"Пауза перед запросом кода: ещё {max(1, int(delay) + 1)} с. Telegram-ограничения не обходятся."
+                    )
+            c.execute(
+                "INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(now + 60)),
+            )
+
+    def _check_api_wait(self):
+        wait = float(self.engine.db.scalar("SELECT value FROM settings WHERE key='auth:api-wait'") or 0)
+        if wait > self.engine.clock():
+            raise DomainError(f"Telegram ограничил вход. Подождите {max(1, int(wait - self.engine.clock()) + 1)} с.")
+
     @auth_serialized
     async def import_file(self, admin_id, filename, content):
         import tempfile
@@ -781,6 +829,8 @@ class AccountAuthorizer:
 
         if self.engine.config.mode != "live":
             raise ValueError("Импорт настоящих сессий доступен только в live")
+        self._validate_api()
+        await self.engine.db.run(self._check_api_wait)
         if len(content) > 20 * 1024 * 1024:
             raise ValueError("Файл слишком большой")
         kind = detect_import_kind(filename, content[:16])
@@ -812,6 +862,7 @@ class AccountAuthorizer:
 
     @auth_serialized
     async def finish_import(self, admin_id, password):
+        await self.engine.db.run(self._check_api_wait)
         pending = self.pending.get(admin_id)
         if not pending or not pending.get("import") or self.engine.clock() - pending["at"] > 600:
             await self._cancel(admin_id)
@@ -853,16 +904,41 @@ class AccountAuthorizer:
     @auth_serialized
     async def begin(self, admin_id, phone):
         self.engine.authorize(admin_id)
+        if self.engine.config.mode == "live":
+            self._validate_api()
+            await self.engine.db.run(self._check_api_wait)
+        pending = self.pending.get(admin_id)
+        if (
+            pending
+            and not pending.get("import")
+            and pending.get("hash")
+            and pending.get("phone") == phone
+            and self.engine.clock() - pending["at"] <= 600
+        ):
+            return pending.get("delivery", "Код уже запрошен. Проверьте приложение Telegram.")
         await self._cancel(admin_id)
         if self.engine.config.mode == "dry-run":
             self.pending[admin_id] = {"phone": phone, "at": self.engine.clock()}
             return
+        await self.engine.db.run(self._reserve_code_request, phone)
         client = self.transport.new_client(updates=False)
         self.pending[admin_id] = {"client": client, "phone": phone, "at": self.engine.clock()}
         try:
             await asyncio.wait_for(client.connect(), 30)
             sent = await asyncio.wait_for(client.send_code_request(phone), 30)
-        except BaseException:
+            if not isinstance(sent, types.auth.SentCode):
+                raise DomainError(
+                    "Telegram не выдал обычный код входа. Используйте официальный клиент и импорт своей сессии; автоматического обхода нет."
+                )
+            if not sent.phone_code_hash:
+                raise DomainError(
+                    "Telegram не вернул состояние кода входа. Отмените вход и повторите после паузы; код не запрашивается автоматически."
+                )
+        except BaseException as exc:
+            if isinstance(exc, errors.FloodWaitError):
+                await self.engine.db.run(self._extend_wait, "auth:api-wait", max(1, exc.seconds))
+            elif type(exc).__name__ == "PhoneNumberFloodError":
+                await self.engine.db.run(self._extend_wait, self._phone_key(phone), 3600)
             await self._cancel(admin_id)
             raise
         self.pending[admin_id] = {
@@ -870,7 +946,9 @@ class AccountAuthorizer:
             "phone": phone,
             "hash": sent.phone_code_hash,
             "at": self.engine.clock(),
+            "delivery": delivery_hint(sent),
         }
+        return self.pending[admin_id]["delivery"]
 
     @auth_serialized
     async def finish(self, admin_id, code=None, password=None):
@@ -878,13 +956,16 @@ class AccountAuthorizer:
         pending = self.pending.get(admin_id)
         if not pending or self.engine.clock() - pending["at"] > 600:
             await self._cancel(admin_id)
-            raise ValueError("Сессия входа истекла. Начните заново")
+            raise DomainError("Сессия входа истекла. Отмените вход и начните заново")
+        if pending.get("import"):
+            raise DomainError("Открыт импорт сессии. Продолжите импорт или отмените его перед входом по номеру.")
         if self.engine.config.mode == "dry-run":
             if code != "00000":
                 raise ValueError("Тестовый код: 00000")
             digest = int(hashlib.sha256(pending["phone"].encode()).hexdigest()[:10], 16)
             self.pending.pop(admin_id)
             return pending["phone"], "dry-run-session", digest
+        await self.engine.db.run(self._check_api_wait)
         client = pending["client"]
         try:
             if password is not None:
@@ -895,6 +976,11 @@ class AccountAuthorizer:
                 )
         except errors.SessionPasswordNeededError:
             return None
+        if not me or not getattr(me, "id", None) or getattr(me, "bot", False):
+            await self._cancel(admin_id)
+            raise DomainError(
+                "Нужен существующий пользовательский аккаунт. Регистрация нового аккаунта или вход бота не выполняются."
+            )
         session = client.session.save()
         phone = pending["phone"]
         await self._cancel(admin_id)

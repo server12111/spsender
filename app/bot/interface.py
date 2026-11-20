@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from app.services.core import RUNTIME_LIMITS, DomainError, dump, row
 from app.services.greetings import greeting_pool
 
-from .labels import LABELS, PERIODS, SECTIONS, label
+from .labels import PERIODS, SECTIONS, label
 
 RUNTIME_TITLES = {
     "batch_size": "Размер пакета",
@@ -167,12 +167,21 @@ class Interface:
         if section == "stats":
             return self.stats(user, period)
         if section == "settings":
+            try:
+                self.e.config.validate_api()
+                api_status = "задана одна пара API ID/hash"
+            except ValueError:
+                api_status = "API ID/hash не заданы или формат неверный"
             return View(
                 "⚙️ Настройки\n\n🌐 "
                 + self.e.get_setting("timezone")
                 + "\n⏱ Пауза подключений: "
                 + self.e.get_setting("join_pause")
-                + " с\n\nСмены по местному времени\nA · 00–06 и 12–18\nB · 06–12 и 18–00",
+                + " с\n🔑 "
+                + api_status
+                + "\nРежим: "
+                + ("тестовый, без запросов кодов" if self.e.config.mode == "dry-run" else "Telegram live")
+                + "\n\nСмены по местному времени\nA · 00–06 и 12–18\nB · 06–12 и 18–00",
                 [
                     [
                         self.button(user, "🌐 Часовой пояс", "form", {"field": "timezone"}),
@@ -605,6 +614,12 @@ class Interface:
             text = f"👤 №{item_id} · {r['name']}\n{r['phone_mask']} · Telegram ID: {r['telegram_id'] or '—'}\n"
             text += f"Рассылка: {member['name'] if member else 'Свободный пул'} · Пара: №{pair['id'] if pair else '—'}\n{shift} · Общих чатов: {n}\n"
             text += f"Подготовка: {label(r['onboarding_stage'])}\nНа этапе: {max(0, int((self.e.clock() - r['stage_started_at']) // 3600))} ч\nСостояние: {label(r['account_health'])} · {'На паузе' if r['paused'] else 'Включён'}"
+            client = getattr(self.transport, "clients", {}).get(item_id)
+            if self.e.config.mode == "dry-run":
+                connection = "тестовый режим, подключения нет"
+            else:
+                connection = "подключён" if client and client.is_connected() else "не подключён"
+            text += "\nСоединение Telegram: " + connection
             if r["flood_until"] > self.e.clock():
                 text += "\nЛимит до " + self.time(r["flood_until"])
             text += metric
@@ -2016,20 +2031,16 @@ class Interface:
             # copied from contacts) are stripped before validation.
             normalized = re.sub(r"[\s()\u00a0\u2013\u2014-]", "", text.strip())
             if not re.fullmatch(r"\+\d{7,15}", normalized):
-                raise DomainError(
-                    "Номер в международном формате с кодом любой страны: +12025550123 или +380671234567"
-                )
+                raise DomainError("Номер в международном формате с кодом любой страны: +12025550123 или +380671234567")
             try:
-                await self.auth.begin(user, normalized)
+                delivery = await self.auth.begin(user, normalized)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                from app.transport.telegram import classify_error
+                from app.transport.authorization import authorization_hint
 
-                classified = classify_error(exc)
-                hint = label(classified.code) if classified.code in LABELS else ""
-                detail = f": {hint}" if hint else "; повторите позже или проверьте подключение"
-                raise DomainError(f"Код не отправлен{detail}") from None
+                await self.e.db.run(self.e.diagnostic, "authorization-ui", exc)
+                raise DomainError(authorization_hint(exc)) from None
             # Phone is retained only inside the authorization object until it can be encrypted.
             await self.e.db.run(self.set_state, user, "account_code", form)
             stage = "Подключение" if form.get("account_id") else "Добавление"
@@ -2038,7 +2049,9 @@ class Interface:
                 + (
                     "\nТестовый код: 00000"
                     if self.e.config.mode == "dry-run"
-                    else "\nСообщение с кодом будет удалено ботом."
+                    else "\n"
+                    + (delivery or "Проверьте уведомления Telegram.")
+                    + "\nСообщение с кодом будет удалено ботом."
                 ),
                 await self.e.db.run(self.cancel, user),
             )

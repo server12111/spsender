@@ -1,6 +1,5 @@
 import asyncio
 import io
-import logging
 from pathlib import Path
 from uuid import uuid4
 
@@ -94,7 +93,9 @@ def make_dispatcher(ui):
         await ui.e.db.run(ui.clear, message.from_user.id)
         if ui.auth:
             await ui.auth.cancel(message.from_user.id)
-        await send_view(message.bot, message.chat.id, await ui.e.db.run(ui.main, message.from_user.id), ui.e.config.media_dir)
+        await send_view(
+            message.bot, message.chat.id, await ui.e.db.run(ui.main, message.from_user.id), ui.e.config.media_dir
+        )
 
     @router.callback_query()
     async def callback(query: CallbackQuery):
@@ -113,10 +114,7 @@ def make_dispatcher(ui):
             try:
                 view = await ui.callback(query.from_user.id, query.data or "")
             except (DomainError, ValueError, PermissionError) as exc:
-                if not isinstance(exc, (DomainError, PermissionError)):
-                    # Full traceback into docker logs / diagnostics.log: without
-                    # it remote failures are undiagnosable.
-                    logging.getLogger("fe_autosender").warning("UI callback rejected", exc_info=True)
+                await ui.e.db.run(ui.e.diagnostic, "UI-callback", exc)
                 text = (
                     str(exc)[:180] if isinstance(exc, (DomainError, PermissionError)) else "Проверьте введённые данные"
                 )
@@ -199,16 +197,18 @@ def make_dispatcher(ui):
                 template["legacy_options"] = legacy_options
             view = await ui.message(user, text, template, txt_content)
         except (DomainError, ValueError, UnicodeError) as exc:
-            if not isinstance(exc, DomainError):
-                # Full traceback into docker logs / diagnostics.log: without it
-                # remote failures like live auth.begin are undiagnosable.
-                logging.getLogger("fe_autosender").warning("UI input rejected", exc_info=True)
+            await ui.e.db.run(ui.e.diagnostic, "UI-input", exc)
             error_text = str(exc) if isinstance(exc, DomainError) else "Проверьте формат данных и повторите ввод"
             view = View(error_text, ui.cancel(user))
         except Exception as exc:
-            logging.getLogger("fe_autosender").warning("UI failure", exc_info=True)
             await ui.e.db.run(ui.e.diagnostic, "UI", exc)
-            view = View("Действие не выполнено. Повторите ввод или отмените мастер.", ui.cancel(user))
+            if sensitive:
+                from app.transport.authorization import authorization_hint
+
+                text = authorization_hint(exc)
+            else:
+                text = "Действие не выполнено. Повторите ввод или отмените мастер."
+            view = View(text, ui.cancel(user))
         finally:
             if sensitive:
                 try:
@@ -370,10 +370,10 @@ async def serve(engine, transport, worker_only=False):
         await bot.session.close()
         raise RuntimeError("Другой процесс уже обслуживает Telegram")
     try:
-        engine.bot_username=(await bot.get_me()).username
+        engine.bot_username = (await bot.get_me()).username
     except BaseException:
         with engine.db.tx() as connection:
-            connection.execute("DELETE FROM worker_leases WHERE name='telegram-runtime' AND owner=?",(worker.owner,))
+            connection.execute("DELETE FROM worker_leases WHERE name='telegram-runtime' AND owner=?", (worker.owner,))
         await bot.session.close()
         raise
     tasks = [asyncio.create_task(worker.run())]

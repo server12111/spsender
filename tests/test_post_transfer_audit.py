@@ -194,7 +194,7 @@ async def test_import_validation_failure_closes_new_client(env, monkeypatch):
 
 async def test_phone_login_connect_and_disconnect_failure_keeps_retry_reference(env):
     e, _, _, _ = env
-    e.config = replace(e.config, mode="live")
+    e.config = replace(e.config, mode="live", api_id=12345, api_hash="a" * 32)
     client = SimpleNamespace(
         connect=AsyncMock(side_effect=ConnectionError("offline")),
         disconnect=AsyncMock(side_effect=ConnectionError("closing failed")),
