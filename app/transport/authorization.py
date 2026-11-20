@@ -2,10 +2,30 @@
 
 import asyncio
 import math
+import traceback
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 from telethon import errors
 
 from app.services.core import DomainError
+
+
+def failure_context(exc, stage):
+    """Call locations and versions only: no messages, source lines or locals."""
+    result = {
+        "stage": stage,
+        "trace": [
+            f"{Path(frame.f_code.co_filename).name}:{frame.f_code.co_name}:{line}"
+            for frame, line in traceback.walk_tb(exc.__traceback__)
+        ][-12:],
+    }
+    for package, key in (("Telethon", "telethon_version"), ("opentele-ng", "opentele_version")):
+        try:
+            result[key] = version(package)
+        except PackageNotFoundError:
+            result[key] = "not-installed"
+    return result
 
 
 def authorization_hint(exc):
@@ -37,6 +57,9 @@ def authorization_hint(exc):
         return "Нет ответа от Telegram. Проверьте сеть сервера. Код мог быть отправлен до обрыва связи; сначала проверьте приложение Telegram."
     if isinstance(exc, errors.RPCError):
         return f"Telegram отклонил авторизацию ({name}). Отмените вход и проверьте диагностику; частые повторы не выполняйте."
+    if isinstance(exc, ValueError):
+        stage = getattr(exc, "authorization_stage", "unknown")
+        return f"Ошибка Telegram-клиента (ValueError), этап {stage}. В журнале нужна строка authorization-step; повторные запросы кода пока не выполняйте."
     return "Не удалось выполнить авторизацию. Проверьте диагностику и настройки сервера."
 
 

@@ -19,7 +19,7 @@ from app.services.chat_pool import parse_target
 from app.services.core import DomainError
 from app.services.memberships import CHALLENGE, membership_links, membership_prompt
 
-from .authorization import delivery_hint
+from .authorization import delivery_hint, failure_context
 from .base import OperationError, Result
 from .limits import RPCBudget
 from .session import BoundedStringSession
@@ -131,9 +131,9 @@ class TelegramTransport:
 
     def new_client(self, session="", updates=True):
         return TelegramClient(
-            BoundedStringSession(session, entity_limit=self.engine.config.entity_cache_limit),
-            self.engine.config.api_id,
-            self.engine.config.api_hash,
+            session=BoundedStringSession(session, entity_limit=self.engine.config.entity_cache_limit),
+            api_id=self.engine.config.api_id,
+            api_hash=self.engine.config.api_hash,
             receive_updates=updates,
             flood_sleep_threshold=0,
             request_retries=0,
@@ -763,16 +763,24 @@ def auth_serialized(function):
     async def guarded(self, admin_id, *args, **kwargs):
         self.engine.authorize(admin_id)
         async with self._locks[admin_id]:
+            self._stages[admin_id] = function.__name__
             try:
                 return await function(self, admin_id, *args, **kwargs)
-            except errors.RPCError as exc:
+            except Exception as exc:
                 pending = self.pending.get(admin_id, {})
                 if isinstance(exc, errors.FloodWaitError):
                     await self.engine.db.run(self._extend_wait, "auth:api-wait", max(1, exc.seconds))
                 elif type(exc).__name__ == "PhoneNumberFloodError" and pending.get("phone"):
                     await self.engine.db.run(self._extend_wait, self._phone_key(pending["phone"]), 3600)
-                await self.engine.db.run(self.engine.diagnostic, "authorization", exc)
+                stage = self._stages[admin_id]
+                if isinstance(exc, ValueError):
+                    exc.authorization_stage = stage
+                await self.engine.db.run(
+                    self.engine.diagnostic, "authorization-step", exc, **failure_context(exc, stage)
+                )
                 raise
+            finally:
+                self._stages.pop(admin_id, None)
 
     return guarded
 
@@ -784,6 +792,7 @@ class AccountAuthorizer:
         self.engine, self.transport = engine, transport
         self.pending = {}
         self._locks = {admin: asyncio.Lock() for admin in engine.config.admin_ids}
+        self._stages = {}
 
     def _validate_api(self):
         try:
@@ -904,6 +913,7 @@ class AccountAuthorizer:
     @auth_serialized
     async def begin(self, admin_id, phone):
         self.engine.authorize(admin_id)
+        self._stages[admin_id] = "validate_api"
         if self.engine.config.mode == "live":
             self._validate_api()
             await self.engine.db.run(self._check_api_wait)
@@ -916,15 +926,20 @@ class AccountAuthorizer:
             and self.engine.clock() - pending["at"] <= 600
         ):
             return pending.get("delivery", "Код уже запрошен. Проверьте приложение Telegram.")
+        self._stages[admin_id] = "cleanup_previous"
         await self._cancel(admin_id)
         if self.engine.config.mode == "dry-run":
             self.pending[admin_id] = {"phone": phone, "at": self.engine.clock()}
             return
+        self._stages[admin_id] = "reserve_request"
         await self.engine.db.run(self._reserve_code_request, phone)
+        self._stages[admin_id] = "create_client"
         client = self.transport.new_client(updates=False)
         self.pending[admin_id] = {"client": client, "phone": phone, "at": self.engine.clock()}
         try:
+            self._stages[admin_id] = "connect"
             await asyncio.wait_for(client.connect(), 30)
+            self._stages[admin_id] = "request_code"
             sent = await asyncio.wait_for(client.send_code_request(phone), 30)
             if not isinstance(sent, types.auth.SentCode):
                 raise DomainError(
@@ -939,7 +954,15 @@ class AccountAuthorizer:
                 await self.engine.db.run(self._extend_wait, "auth:api-wait", max(1, exc.seconds))
             elif type(exc).__name__ == "PhoneNumberFloodError":
                 await self.engine.db.run(self._extend_wait, self._phone_key(phone), 3600)
-            await self._cancel(admin_id)
+            try:
+                await self._cancel(admin_id)
+            except Exception as cleanup_error:
+                await self.engine.db.run(
+                    self.engine.diagnostic,
+                    "authorization-cleanup",
+                    cleanup_error,
+                    **failure_context(cleanup_error, "disconnect_failed_login"),
+                )
             raise
         self.pending[admin_id] = {
             "client": client,
@@ -969,8 +992,10 @@ class AccountAuthorizer:
         client = pending["client"]
         try:
             if password is not None:
+                self._stages[admin_id] = "sign_in_password"
                 me = await asyncio.wait_for(client.sign_in(password=password), 30)
             else:
+                self._stages[admin_id] = "sign_in_code"
                 me = await asyncio.wait_for(
                     client.sign_in(pending["phone"], code=code, phone_code_hash=pending["hash"]), 30
                 )
