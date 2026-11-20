@@ -137,6 +137,7 @@ class TelegramTransport:
             receive_updates=updates,
             flood_sleep_threshold=0,
             request_retries=0,
+            raise_last_call_error=True,
             connection_retries=1,
             auto_reconnect=False,
             timeout=30,
@@ -800,6 +801,22 @@ class AccountAuthorizer:
         except ValueError as exc:
             raise DomainError(str(exc)) from None
 
+    @staticmethod
+    async def _request_code(client, phone):
+        """Follow explicit wrong-DC rejections only, never ambiguous failures.
+
+        Telethon switches DC before re-raising a migration when its retry
+        budget is zero. Keeping zero retries protects message delivery too.
+        """
+        visited = set()
+        for attempt in range(3):
+            try:
+                return await client.send_code_request(phone)
+            except (errors.PhoneMigrateError, errors.NetworkMigrateError, errors.UserMigrateError) as exc:
+                if attempt == 2 or exc.new_dc in visited or await client.is_user_authorized():
+                    raise
+                visited.add(exc.new_dc)
+
     def _phone_key(self, phone):
         digest = hmac.new(self.engine.config.session_key.encode(), phone.encode(), hashlib.sha256).hexdigest()
         return "auth:phone-wait:" + digest
@@ -940,7 +957,7 @@ class AccountAuthorizer:
             self._stages[admin_id] = "connect"
             await asyncio.wait_for(client.connect(), 30)
             self._stages[admin_id] = "request_code"
-            sent = await asyncio.wait_for(client.send_code_request(phone), 30)
+            sent = await asyncio.wait_for(self._request_code(client, phone), 30)
             if not isinstance(sent, types.auth.SentCode):
                 raise DomainError(
                     "Telegram не выдал обычный код входа. Используйте официальный клиент и импорт своей сессии; автоматического обхода нет."
