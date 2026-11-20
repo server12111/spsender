@@ -76,6 +76,7 @@ class Core:
             c.execute("INSERT OR IGNORE INTO settings VALUES ('join_pause',?)", (str(config.join_pause),))
             for key in RUNTIME_LIMITS:
                 c.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, str(getattr(config, key))))
+            self._initialize_api_pool(c)
 
     def authorize(self, admin_id):
         if admin_id not in self.config.admin_ids:

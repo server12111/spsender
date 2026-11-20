@@ -11,12 +11,14 @@ def parse_target(value):
     match = re.fullmatch(r"(?:https?://)?t\.me/c/(\d+)/(\d+)(?:/\d+)?/?", value)
     if match:
         return int("-100" + match[1]), int(match[2]), value
-    match = re.fullmatch(r"(?:(?:https?://)?t\.me/|@)([A-Za-z][A-Za-z0-9_]{3,})(?:/(\d+))?/?", value)
+    match = re.fullmatch(
+        r"(?:(?:https?://)?(?:t\.me|telegram\.me)/|@)?([A-Za-z][A-Za-z0-9_]{3,31})(?:/(\d+))?/?", value
+    )
     if match:
         return None, int(match[2] or 0), "@" + match[1].lower()
     if re.fullmatch(r"(?:https?://)?t\.me/\+[A-Za-z0-9_-]+", value):
         return None, 0, value if value.startswith("http") else "https://" + value
-    raise DomainError("Укажите ID[:тема], @username или ссылку t.me")
+    raise DomainError("Укажите username, @username, ID[:тема] или ссылку t.me")
 
 
 class ChatPool:

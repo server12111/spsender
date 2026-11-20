@@ -32,8 +32,11 @@ def full_group_queue(e):
     e.tick()
     assert not incoming_group(e, pair)
     with e.db.tx() as c:
-        c.execute("INSERT INTO group_reply_intents(campaign_id,pair_id,account_id,chat_pool_id,peer_id,payload,version,idempotency_key,created_at) "
-                  "VALUES (?,?,?,?,?,'{}',1,'legacy-group',?)", (campaign,pair,a,chats[0],-100000,e.clock()))
+        c.execute(
+            "INSERT INTO group_reply_intents(campaign_id,pair_id,account_id,chat_pool_id,peer_id,payload,version,idempotency_key,created_at) "
+            "VALUES (?,?,?,?,?,'{}',1,'legacy-group',?)",
+            (campaign, pair, a, chats[0], -100000, e.clock()),
+        )
     return campaign, pair, a, b, chats
 
 
@@ -211,13 +214,14 @@ async def test_failed_retirement_does_not_create_a_second_session_client(env):
 
 async def test_failed_cleanup_keeps_half_created_client_for_shutdown_retry(env):
     e, _, _, _ = env
+    e.config = replace(e.config, api_id=12345, api_hash="a" * 32)
     _, _, a, _, _ = setup_pair(e, 1)
     transport, client = closing_transport(e)
     transport.clients.clear()
     transport._client_sessions.clear()
     transport._client_locks = WeakValueDictionary()
     client.connect = AsyncMock(side_effect=ConnectionError("connect failed"))
-    transport.new_client = lambda session: client
+    transport.new_client = lambda session, **kwargs: client
     with pytest.raises(OperationError):
         await transport.client(a)
     assert transport.clients[a] is client

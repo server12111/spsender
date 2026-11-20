@@ -183,7 +183,7 @@ def test_account_card_displays_connection_without_connecting_or_exposing_secrets
     view = ui.card(123, "accounts", a)
     assert ("Соединение Telegram: подключён" if connected else "Соединение Telegram: не подключён") in view.text
     assert "session-a" not in view.text and e.config.api_hash not in view.text
-    assert "одна пара API" in ui.listing(123, "settings").text
+    assert "Пул API" in ui.listing(123, "settings").text
 
 
 async def test_wrong_code_and_password_preserve_login_and_do_not_resend(env):

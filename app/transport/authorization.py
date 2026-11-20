@@ -11,6 +11,18 @@ from telethon import errors
 from app.services.core import DomainError
 
 
+class AuthorizedSession(tuple):
+    """The existing three-field result, plus its fixed API identity."""
+
+    def __new__(cls, phone, session, telegram_id, credential_id=None):
+        result = super().__new__(cls, (phone, session, telegram_id))
+        result.credential_id = credential_id
+        return result
+
+    def __repr__(self):
+        return "AuthorizedSession(<private>)"
+
+
 def failure_context(exc, stage):
     """Call locations and versions only: no messages, source lines or locals."""
     result = {

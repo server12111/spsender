@@ -117,7 +117,7 @@ class Config:
     def validate_bot(self):
         if not self.bot_token or not self.admin_ids or not self.session_key:
             raise ValueError("Задайте BOT_TOKEN, ADMIN_IDS и SESSION_KEY в .env")
-        if self.mode == "live":
+        if self.mode == "live" and (self.api_id or self.api_hash):
             self.validate_api()
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +126,7 @@ class Config:
             not isinstance(self.api_id, int)
             or isinstance(self.api_id, bool)
             or self.api_id <= 0
+            or self.api_id >= 2**31
             or not re.fullmatch(r"[a-fA-F0-9]{32}", self.api_hash)
         ):
             raise ValueError(

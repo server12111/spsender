@@ -1,4 +1,5 @@
 LABELS = {
+    "ACCOUNT_API_REQUIRED": "Для сессии нужны её прежние API-реквизиты",
     "ACKNOWLEDGED_BUT_NOT_COMMITTED": "Telegram подтвердил отправку; результат не сохранён в базе",
     "DRAFT": "Черновик",
     "RUNNING": "Работает",

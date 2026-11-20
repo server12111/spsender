@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from weakref import WeakValueDictionary
@@ -336,18 +337,19 @@ class ConnectionClient:
 
 async def test_successful_connection_resets_only_network_backoff(env):
     e, clock, _, _ = env
+    e.config = replace(e.config, api_id=12345, api_hash="a" * 32)
     _, _, a, _, _ = setup_pair(e, 1)
     transport = adapter(e)
     transport.clients, transport._client_sessions = {}, {}
     transport._client_locks = WeakValueDictionary()
     transport._start_incoming = lambda: None
-    transport.new_client = lambda session: ConnectionClient(failed=True)
+    transport.new_client = lambda session, **kwargs: ConnectionClient(failed=True)
     with pytest.raises(OperationError):
         await transport.client(a)
     assert e.db.scalar("SELECT connection_failures FROM accounts WHERE id=?", (a,)) == 1
     clock.advance(6)
     e.critical(a, "RESTRICTED")
-    transport.new_client = lambda session: ConnectionClient()
+    transport.new_client = lambda session, **kwargs: ConnectionClient()
     await transport.client(a)  # Explicit authorization check must not clear moderation restrictions.
     record = e.db.one("SELECT * FROM accounts WHERE id=?", (a,))
     assert record["connection_failures"] == 0 and record["connection_retry_at"] == 0
@@ -703,9 +705,9 @@ async def test_chat_lock_wait_renews_lease_before_execution(env):
     transport._operation_semaphore = SimpleNamespace(acquire=AsyncMock(return_value=budget), release=AsyncMock())
 
     async def bounded(current_job):
-        assert (
-            e.db.scalar("SELECT lease_until FROM dispatch_jobs WHERE id=?", (job["id"],)) > clock()
-        ), "lease expired before the network phase"
+        assert e.db.scalar("SELECT lease_until FROM dispatch_jobs WHERE id=?", (job["id"],)) > clock(), (
+            "lease expired before the network phase"
+        )
         return Result(1)
 
     transport._execute_bounded = bounded

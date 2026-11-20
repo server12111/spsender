@@ -167,11 +167,14 @@ class Interface:
         if section == "stats":
             return self.stats(user, period)
         if section == "settings":
-            try:
-                self.e.config.validate_api()
-                api_status = "задана одна пара API ID/hash"
-            except ValueError:
-                api_status = "API ID/hash не заданы или формат неверный"
+            count = self.e.db.scalar("SELECT count(*) FROM api_credentials WHERE enabled=1")
+            api_status = f"Пул API: {count} включено"
+            if not count:
+                try:
+                    self.e.config.validate_api()
+                    api_status += " · есть пара в .env"
+                except ValueError:
+                    api_status += " · добавьте API ID/hash"
             return View(
                 "⚙️ Настройки\n\n🌐 "
                 + self.e.get_setting("timezone")
@@ -188,7 +191,12 @@ class Interface:
                         self.button(user, "⏱ Пауза 50–100 с", "form", {"field": "join_pause"}),
                     ]
                 ]
-                + [[self.button(user, "📦 Очередь и повторы", "queue_settings")]]
+                + [
+                    [
+                        self.button(user, "🔑 Пул API ID/hash", "api_pool"),
+                        self.button(user, "📦 Очередь и повторы", "queue_settings"),
+                    ]
+                ]
                 + self.nav(user),
             )
         if section == "errors":
@@ -400,6 +408,36 @@ class Interface:
             ],
         ]
         return View(text, buttons + self.nav(user))
+
+    def api_pool_view(self, user, page=0):
+        self.e.authorize(user)
+        records = self.e.api_pool(page)
+        text = "🔑 Пул API ID/hash\n\nСвои API-пары. Новые аккаунты получают пару автоматически; закрепление сохраняется.\n"
+        buttons = [[self.button(user, "➕ Добавить API", "api_add", once=True)]]
+        for item in records[:8]:
+            text += f"\n№{item['id']} · {item['name']} · API ID {item['api_id']}\nАккаунтов: {item['accounts']} · {'Включена' if item['enabled'] else 'Выключена для новых входов'} · hash: скрыт\n"
+            buttons.append(
+                [
+                    self.button(
+                        user,
+                        ("⏸ Выключить №" if item["enabled"] else "▶️ Включить №") + str(item["id"]),
+                        "api_toggle",
+                        {"id": item["id"], "value": not item["enabled"], "expected": bool(item["enabled"])},
+                        True,
+                    )
+                ]
+            )
+        self.pagination(buttons, user, "api_pool", {}, page, len(records) > 8)
+        buttons.append([self.button(user, "◀️ Настройки", "list", {"section": "settings"})])
+        return View(
+            text
+            + (
+                "\nПул пуст. Нажмите «Добавить API»."
+                if not records
+                else "\nВыключение влияет только на новые входы. Закреплённые аккаунты продолжают использовать свою пару."
+            ),
+            buttons,
+        )
 
     def warmup_pool_view(self, user, page=0):
         self.e.authorize(user)
@@ -620,6 +658,11 @@ class Interface:
             else:
                 connection = "подключён" if client and client.is_connected() else "не подключён"
             text += "\nСоединение Telegram: " + connection
+            api = self.e.db.one(
+                "SELECT k.name,k.api_id FROM account_api_bindings b JOIN api_credentials k ON k.id=b.credential_id WHERE b.account_id=?",
+                (item_id,),
+            )
+            text += f"\nAPI: {api['name']} · {api['api_id']}" if api else "\nAPI: прежняя пара из .env до закрепления"
             if r["flood_until"] > self.e.clock():
                 text += "\nЛимит до " + self.time(r["flood_until"])
             text += metric
@@ -1257,6 +1300,17 @@ class Interface:
             return await self.e.db.run(self.stats, user, data.get("period", "today"), data.get("details", True))
         if action == "queue_settings":
             return await self.e.db.run(self.queue_settings, user)
+        if action == "api_pool":
+            return await self.e.db.run(self.api_pool_view, user, data.get("page", 0))
+        if action == "api_add":
+            await self.e.db.run(self.set_state, user, "api_credentials")
+            return View(
+                "Отправьте свою пару одним сообщением:\nAPI_ID API_HASH\n\nИли с названием:\nНазвание | API_ID | API_HASH\n\nHash хранится зашифрованно. Сообщение будет удалено.",
+                await self.e.db.run(self.cancel, user),
+            )
+        if action == "api_toggle":
+            await self.e.db.run(self.e.set_api_enabled, item_id, data["value"], data["expected"])
+            return await self.e.db.run(self.api_pool_view, user)
         if action == "pair_tools":
             return View(
                 "⚙️ Настройка пар\n\nПары собираются сами внутри рассылки. Ручное связывание — только при необходимости.",
@@ -1443,7 +1497,7 @@ class Interface:
                 )
             await self.e.db.run(self.set_state, user, "import_chats")
             return View(
-                "Шаг 1 из 2\nОтправьте ссылки / ID по одной на строку или TXT-файл UTF-8.\nПрава публикации подтверждаются на следующем шаге.",
+                "Шаг 1 из 2\nОтправьте username, @username, ссылки или ID. Разделяйте пробелами, запятыми или переносами строк; можно TXT-файл UTF-8.\nПрава публикации подтверждаются на следующем шаге.",
                 await self.e.db.run(self.cancel, user),
             )
         if action.startswith("wizard_"):
@@ -1823,7 +1877,7 @@ class Interface:
         state = await self.e.db.run(self.state, user)
         if not state or state["state"] != "account_import":
             raise DomainError("Сначала откройте импорт аккаунта")
-        result = await self.auth.import_file(user, filename, content)
+        result = await self.auth.import_file(user, filename, content, account_id=state["data"].get("account_id"))
         if result is None:
             await self.e.db.run(self.set_state, user, "account_import_password", state["data"])
             return View(
@@ -1833,14 +1887,19 @@ class Interface:
 
     async def _save_authorized_account(self, user, result, form):
         phone, session, telegram_id = result
+        credential_id = getattr(result, "credential_id", None)
         if form.get("account_id"):
-            await self.e.db.run(self.e.save_session, form["account_id"], session, telegram_id)
+            await self.e.db.run(
+                self.e.save_session, form["account_id"], session, telegram_id, api_credential_id=credential_id
+            )
             account_id, choices = form["account_id"], []
         else:
             # The name question was removed: default to a phone-based name,
             # renamable from the account card at any time.
             name = (form.get("name") or "").strip() or f"Аккаунт {(phone or '0000')[-4:]}"
-            account_id, choices = await self.e.db.run(self.e.add_account, name, phone, session, telegram_id)
+            account_id, choices = await self.e.db.run(
+                self.e.add_account, name, phone, session, telegram_id, api_credential_id=credential_id
+            )
         await self.e.db.run(self.clear, user)
         if choices:
             return View(
@@ -1906,6 +1965,22 @@ class Interface:
         if not state:
             return await self.e.db.run(self.main, user, "Выберите действие кнопкой")
         name, form = state["state"], state["data"]
+        if name == "api_credentials":
+            parts = [part.strip() for part in text.split("|")] if "|" in text else text.split()
+            try:
+                if len(parts) == 2:
+                    title, api_id, api_hash = "API " + parts[0], int(parts[0]), parts[1]
+                elif len(parts) == 3:
+                    title, api_id, api_hash = parts[0], int(parts[1]), parts[2]
+                else:
+                    raise ValueError()
+            except ValueError:
+                raise DomainError("Формат: API_ID API_HASH или Название | API_ID | API_HASH") from None
+            await self.e.db.run(self.e.add_api_credential, title, api_id, api_hash)
+            await self.e.db.run(self.clear, user, form["_revision"])
+            view = await self.e.db.run(self.api_pool_view, user)
+            view.text = "✅ API-пара сохранена\n\n" + view.text
+            return view
         if name == "account_import_password":
             result = await self.auth.finish_import(user, text)
             if result is None:
@@ -2033,7 +2108,7 @@ class Interface:
             if not re.fullmatch(r"\+\d{7,15}", normalized):
                 raise DomainError("Номер в международном формате с кодом любой страны: +12025550123 или +380671234567")
             try:
-                delivery = await self.auth.begin(user, normalized)
+                delivery = await self.auth.begin(user, normalized, account_id=form.get("account_id"))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2070,7 +2145,9 @@ class Interface:
             return await self._save_authorized_account(user, result, form)
         if name == "import_chats":
             content = txt_content if txt_content is not None else text
-            lines = list(dict.fromkeys(line.strip() for line in content.splitlines() if line.strip()))
+            import re
+
+            lines = list(dict.fromkeys(line for line in re.split(r"[\s,;]+", content.strip()) if line))
             if not lines or len(lines) > 1000:
                 raise DomainError("Импортируйте от 1 до 1000 строк за один раз")
             from app.services.chat_pool import parse_target

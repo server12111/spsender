@@ -178,6 +178,7 @@ async def test_import_connect_failure_closes_registered_source(env, monkeypatch)
 
 async def test_import_validation_failure_closes_new_client(env, monkeypatch):
     e, _, _, _ = env
+    e.config = replace(e.config, api_id=12345, api_hash="a" * 32)
     source = SimpleNamespace(disconnect=AsyncMock())
     native = SimpleNamespace(
         is_user_authorized=AsyncMock(side_effect=ConnectionError("offline")), disconnect=AsyncMock()
@@ -210,6 +211,7 @@ async def test_phone_login_connect_and_disconnect_failure_keeps_retry_reference(
 
 async def test_import_retry_after_cleanup_failure_reuses_existing_client(env, monkeypatch):
     e, _, _, _ = env
+    e.config = replace(e.config, api_id=12345, api_hash="a" * 32)
     client = SimpleNamespace(
         get_me=AsyncMock(return_value=SimpleNamespace(id=777, phone="380111111111", bot=False)),
         session=SimpleNamespace(save=lambda: "session"),

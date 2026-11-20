@@ -18,7 +18,7 @@ class Accounts:
             )
         )
 
-    def add_account(self, name, phone, session="", telegram_id=None, campaign_id=None):
+    def add_account(self, name, phone, session="", telegram_id=None, campaign_id=None, api_credential_id=None):
         if not name.strip():
             raise DomainError("Укажите название аккаунта")
         now = self.clock()
@@ -45,6 +45,7 @@ class Accounts:
                 "INSERT INTO account_sessions VALUES (?,?,?,?)",
                 (account_id, self.secrets.encrypt(session), self.secrets.encrypt(phone), now),
             )
+            self._bind_api(c, account_id, api_credential_id)
             c.execute(
                 "INSERT INTO account_onboarding_events(account_id,stage,created_at) VALUES (?,?,?)",
                 (account_id, "SILENT_24H", now),
@@ -174,7 +175,7 @@ class Accounts:
                 raise DomainError("Неизвестное действие")
             self.audit(c, "ACCOUNT_" + action.upper(), account_id=account_id)
 
-    def save_session(self, account_id, session, telegram_id):
+    def save_session(self, account_id, session, telegram_id, api_credential_id=None):
         with self.db.tx() as c:
             account = row(c, "SELECT * FROM accounts WHERE id=?", (account_id,))
             if not account or account["account_health"] == "REMOVED":
@@ -183,6 +184,7 @@ class Accounts:
                 raise DomainError("Этот номер принадлежит другому Telegram аккаунту. Добавьте его отдельно")
             if self._account_operation_unresolved(c, account_id):
                 raise DomainError("Сначала дождитесь / сверьте текущую операцию аккаунта")
+            self._bind_api(c, account_id, api_credential_id)
             c.execute(
                 "UPDATE account_sessions SET encrypted_session=?,updated_at=? WHERE account_id=?",
                 (self.secrets.encrypt(session), self.clock(), account_id),

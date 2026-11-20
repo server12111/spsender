@@ -1,4 +1,5 @@
 from .accounts import Accounts
+from .api_pool import ApiPool
 from .autoresponders import Autoresponders
 from .campaigns import Campaigns
 from .chat_pool import ChatPool
@@ -16,6 +17,7 @@ from .statistics import Statistics
 
 
 class Engine(
+    ApiPool,
     Accounts,
     Campaigns,
     Pairs,

@@ -148,6 +148,7 @@ def make_dispatcher(ui):
             await message.answer("База временно недоступна. Повторите ввод позже")
             return
         sensitive = state and state["state"] in {
+            "api_credentials",
             "account_code",
             "account_password",
             "account_phone",

@@ -19,7 +19,7 @@ from app.services.chat_pool import parse_target
 from app.services.core import DomainError
 from app.services.memberships import CHALLENGE, membership_links, membership_prompt
 
-from .authorization import delivery_hint, failure_context
+from .authorization import AuthorizedSession, delivery_hint, failure_context
 from .base import OperationError, Result
 from .limits import RPCBudget
 from .session import BoundedStringSession
@@ -129,11 +129,11 @@ class TelegramTransport:
         self._operation_locks = WeakValueDictionary()
         self._chat_operation_locks = WeakValueDictionary()
 
-    def new_client(self, session="", updates=True):
+    def new_client(self, session="", updates=True, api_identity=None):
         return TelegramClient(
             session=BoundedStringSession(session, entity_limit=self.engine.config.entity_cache_limit),
-            api_id=self.engine.config.api_id,
-            api_hash=self.engine.config.api_hash,
+            api_id=api_identity.api_id if api_identity else self.engine.config.api_id,
+            api_hash=api_identity.api_hash if api_identity else self.engine.config.api_hash,
             receive_updates=updates,
             flood_sleep_threshold=0,
             request_retries=0,
@@ -180,7 +180,8 @@ class TelegramTransport:
             client = None
             try:
                 session = self.engine.secrets.decrypt(account["encrypted_session"])
-                client = self.new_client(session)
+                identity = await self.engine.db.run(self.engine.account_api, account_id)
+                client = self.new_client(session, api_identity=identity)
                 await asyncio.wait_for(client.connect(), 30)
 
                 @client.on(events.NewMessage(incoming=True))
@@ -208,6 +209,8 @@ class TelegramTransport:
                     raise
                 if isinstance(exc, OperationError):
                     raise
+                if isinstance(exc, DomainError):
+                    raise OperationError("configuration", "ACCOUNT_API_REQUIRED") from None
                 from cryptography.fernet import InvalidToken
 
                 if isinstance(exc, (InvalidToken, ValueError)):
@@ -795,12 +798,6 @@ class AccountAuthorizer:
         self._locks = {admin: asyncio.Lock() for admin in engine.config.admin_ids}
         self._stages = {}
 
-    def _validate_api(self):
-        try:
-            self.engine.config.validate_api()
-        except ValueError as exc:
-            raise DomainError(str(exc)) from None
-
     @staticmethod
     async def _request_code(client, phone):
         """Follow explicit wrong-DC rejections only, never ambiguous failures.
@@ -848,14 +845,14 @@ class AccountAuthorizer:
             raise DomainError(f"Telegram ограничил вход. Подождите {max(1, int(wait - self.engine.clock()) + 1)} с.")
 
     @auth_serialized
-    async def import_file(self, admin_id, filename, content):
+    async def import_file(self, admin_id, filename, content, account_id=None):
         import tempfile
 
         from app.legacy.session_import import detect_import_kind, load_import_source, sqlite_session_kind
 
         if self.engine.config.mode != "live":
             raise ValueError("Импорт настоящих сессий доступен только в live")
-        self._validate_api()
+        identity = await self.engine.db.run(self.engine.authorization_api, account_id)
         await self.engine.db.run(self._check_api_wait)
         if len(content) > 20 * 1024 * 1024:
             raise ValueError("Файл слишком большой")
@@ -866,7 +863,7 @@ class AccountAuthorizer:
         directory = tempfile.TemporaryDirectory(prefix="fe-account-import-")
         path = Path(directory.name) / ("source.zip" if kind == "tdata" else "source.session")
         path.write_bytes(content)
-        pending = {"directory": directory, "at": self.engine.clock(), "import": True}
+        pending = {"directory": directory, "at": self.engine.clock(), "import": True, "api": identity}
         self.pending[admin_id] = pending
         try:
             if kind == "session":
@@ -905,13 +902,16 @@ class AccountAuthorizer:
         from app.legacy.session_import import ImportPasswordRequired, create_new_session
 
         pending = self.pending[admin_id]
+        identity = pending.get("api")
+        if identity is None:
+            identity = pending["api"] = await self.engine.db.run(self.engine.authorization_api)
         client = pending.get("client")
         if client is None:
             try:
                 client = await asyncio.wait_for(
                     create_new_session(
                         pending["source"],
-                        APIData(api_id=self.engine.config.api_id, api_hash=self.engine.config.api_hash),
+                        APIData(api_id=identity.api_id, api_hash=identity.api_hash),
                         password=password,
                         register_client=lambda client: pending.__setitem__("client", client),
                     ),
@@ -923,16 +923,15 @@ class AccountAuthorizer:
         me = await asyncio.wait_for(client.get_me(), 30)
         if not me or getattr(me, "bot", False) or not getattr(me, "phone", None):
             raise ValueError("Сессия должна принадлежать вашему пользовательскому аккаунту")
-        result = ("+" + me.phone.lstrip("+"), client.session.save(), me.id)
+        result = AuthorizedSession("+" + me.phone.lstrip("+"), client.session.save(), me.id, identity.credential_id)
         await self._cancel(admin_id)
         return result
 
     @auth_serialized
-    async def begin(self, admin_id, phone):
+    async def begin(self, admin_id, phone, account_id=None):
         self.engine.authorize(admin_id)
         self._stages[admin_id] = "validate_api"
         if self.engine.config.mode == "live":
-            self._validate_api()
             await self.engine.db.run(self._check_api_wait)
         pending = self.pending.get(admin_id)
         if (
@@ -940,19 +939,36 @@ class AccountAuthorizer:
             and not pending.get("import")
             and pending.get("hash")
             and pending.get("phone") == phone
+            and pending.get("account_id") == account_id
             and self.engine.clock() - pending["at"] <= 600
         ):
             return pending.get("delivery", "Код уже запрошен. Проверьте приложение Telegram.")
         self._stages[admin_id] = "cleanup_previous"
         await self._cancel(admin_id)
         if self.engine.config.mode == "dry-run":
-            self.pending[admin_id] = {"phone": phone, "at": self.engine.clock()}
+            identity = None
+            if await self.engine.db.run(self.engine.db.scalar, "SELECT count(*) FROM api_credentials WHERE enabled=1"):
+                identity = await self.engine.db.run(self.engine.authorization_api, account_id)
+            self.pending[admin_id] = {
+                "phone": phone,
+                "at": self.engine.clock(),
+                "api": identity,
+                "account_id": account_id,
+            }
             return
+        self._stages[admin_id] = "validate_api"
+        identity = await self.engine.db.run(self.engine.authorization_api, account_id)
         self._stages[admin_id] = "reserve_request"
         await self.engine.db.run(self._reserve_code_request, phone)
         self._stages[admin_id] = "create_client"
-        client = self.transport.new_client(updates=False)
-        self.pending[admin_id] = {"client": client, "phone": phone, "at": self.engine.clock()}
+        client = self.transport.new_client(updates=False, api_identity=identity)
+        self.pending[admin_id] = {
+            "client": client,
+            "phone": phone,
+            "at": self.engine.clock(),
+            "api": identity,
+            "account_id": account_id,
+        }
         try:
             self._stages[admin_id] = "connect"
             await asyncio.wait_for(client.connect(), 30)
@@ -987,6 +1003,8 @@ class AccountAuthorizer:
             "hash": sent.phone_code_hash,
             "at": self.engine.clock(),
             "delivery": delivery_hint(sent),
+            "api": identity,
+            "account_id": account_id,
         }
         return self.pending[admin_id]["delivery"]
 
@@ -1004,7 +1022,10 @@ class AccountAuthorizer:
                 raise ValueError("Тестовый код: 00000")
             digest = int(hashlib.sha256(pending["phone"].encode()).hexdigest()[:10], 16)
             self.pending.pop(admin_id)
-            return pending["phone"], "dry-run-session", digest
+            identity = pending.get("api")
+            return AuthorizedSession(
+                pending["phone"], "dry-run-session", digest, identity.credential_id if identity else None
+            )
         await self.engine.db.run(self._check_api_wait)
         client = pending["client"]
         try:
@@ -1025,8 +1046,9 @@ class AccountAuthorizer:
             )
         session = client.session.save()
         phone = pending["phone"]
+        identity = pending.get("api")
         await self._cancel(admin_id)
-        return phone, session, me.id
+        return AuthorizedSession(phone, session, me.id, identity.credential_id if identity else None)
 
     @auth_serialized
     async def cancel(self, admin_id):

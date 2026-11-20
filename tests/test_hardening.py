@@ -382,7 +382,7 @@ class LocalClient:
 async def test_one_mtproto_client_per_account_and_session_refresh(env, monkeypatch):
     e, _, _, _ = env
     _, _, a, _, _ = setup_pair(e, 1)
-    e.config = replace(e.config, mode="live")
+    e.config = replace(e.config, mode="live", api_id=12345, api_hash="a" * 32)
     transport = TelegramTransport(e)
     created = []
 
@@ -408,7 +408,7 @@ async def test_one_mtproto_client_per_account_and_session_refresh(env, monkeypat
 async def test_connect_cancellation_disconnects_half_created_client(env, monkeypatch):
     e, _, _, _ = env
     _, _, a, _, _ = setup_pair(e, 1)
-    e.config = replace(e.config, mode="live")
+    e.config = replace(e.config, mode="live", api_id=12345, api_hash="a" * 32)
     transport = TelegramTransport(e)
     started = asyncio.Event()
 
@@ -420,7 +420,7 @@ async def test_connect_cancellation_disconnects_half_created_client(env, monkeyp
     client = Hanging()
     monkeypatch.setattr(transport, "new_client", lambda *a, **k: client)
     task = asyncio.create_task(transport.client(a))
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -431,7 +431,7 @@ async def test_connect_cancellation_disconnects_half_created_client(env, monkeyp
 async def test_incoming_overload_is_bounded_and_visible_to_admin(env, monkeypatch):
     e, _, _, sink = env
     _, _, a, _, _ = setup_pair(e, 1)
-    e.config = replace(e.config, mode="live", incoming_queue_size=1)
+    e.config = replace(e.config, mode="live", incoming_queue_size=1, api_id=12345, api_hash="a" * 32)
     transport = TelegramTransport(e)
     client = LocalClient()
     monkeypatch.setattr(transport, "new_client", lambda *a, **k: client)
@@ -840,7 +840,7 @@ def test_upgrade_from_existing_v200_preserves_data_and_attempts(env, tmp_path):
     db.migrate()
     assert db.scalar("SELECT current_attempt_id FROM dispatch_jobs") == 7
     assert db.scalar("SELECT encrypted_session FROM account_sessions") == "cipher-preserved"
-    assert db.scalar("SELECT count(*) FROM schema_migrations") == 12
+    assert db.scalar("SELECT count(*) FROM schema_migrations") == 13
     assert not db.all("PRAGMA foreign_key_check")
 
 
