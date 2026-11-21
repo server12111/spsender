@@ -437,6 +437,16 @@ async def test_incoming_overload_is_bounded_and_visible_to_admin(env, monkeypatc
     monkeypatch.setattr(transport, "new_client", lambda *a, **k: client)
     gate = asyncio.Event()
 
+    recorded = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_overload = e.incoming_overload
+
+    def record_overload(count):
+        original_overload(count)
+        loop.call_soon_threadsafe(recorded.set)
+
+    monkeypatch.setattr(e, "incoming_overload", record_overload)
+
     async def handle(*args):
         await gate.wait()
 
@@ -447,7 +457,7 @@ async def test_incoming_overload_is_bounded_and_visible_to_admin(env, monkeypatc
         for _ in range(10):
             await client.handlers[0](event)
         assert transport._incoming.qsize() <= 1 and transport._incoming_dropped >= 1
-        await asyncio.sleep(0.08)
+        await asyncio.wait_for(recorded.wait(), 10)
         assert e.db.scalar("SELECT count(*) FROM notifications_outbox WHERE kind='overload'") == 1
         await e.deliver_notifications(sink)
         assert sink.messages[-1][1] == "overload"

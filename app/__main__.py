@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import tempfile
 from pathlib import Path
@@ -12,14 +13,16 @@ from app.db import Database
 from app.security import SecretBox
 from app.security.secrets import configure_logging
 from app.services import Engine
+from app.storage import validate_runtime_storage
 
 
 def build(config):
-    db = Database(config.database_path, config.sqlite_busy_ms)
-    db.migrate()
     if not config.session_key:
         raise ValueError("Задайте SESSION_KEY (python -m app keygen)")
-    return Engine(db, config, SecretBox(config.session_key))
+    secrets = SecretBox(config.session_key)
+    db = Database(config.database_path, config.sqlite_busy_ms)
+    db.migrate()
+    return Engine(db, config, secrets)
 
 
 async def smoke():
@@ -63,6 +66,13 @@ def main():
     # Config first so file logs land next to the (possibly relocated) database.
     config = Config.load()
     configure_logging(Path(config.database_path).parent / "logs")
+    if args.command in {"run", "worker"}:
+        mount = validate_runtime_storage(config)
+        logging.getLogger("fe_autosender").warning(
+            "STORAGE database=%s data_mount=%s",
+            Path(config.database_path).resolve(),
+            mount["path"] if mount else "local",
+        )
     if args.command == "smoke":
         asyncio.run(smoke())
         return

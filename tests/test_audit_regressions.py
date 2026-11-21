@@ -606,8 +606,8 @@ def test_invalid_env_value_names_the_variable(monkeypatch):
         Config.load()
 
 
-def test_data_dir_convention_and_database_path_precedence(monkeypatch):
-    """Hosting keeps persistent files in DATA_DIR; an explicit DATABASE_PATH still wins."""
+def test_data_dir_is_the_only_hosting_path_setting(monkeypatch):
+    """A stale DATABASE_PATH must never override the selected persistent directory."""
     import os
 
     from app.config import Config
@@ -617,7 +617,7 @@ def test_data_dir_convention_and_database_path_precedence(monkeypatch):
     config = Config.load()
     assert config.database_path == os.path.join("/app/data", "fe_autosender.sqlite3")
     monkeypatch.setenv("DATABASE_PATH", "/app/data/custom.sqlite3")
-    assert Config.load().database_path == "/app/data/custom.sqlite3"
+    assert Config.load().database_path == os.path.join("/app/data", "fe_autosender.sqlite3")
 
 
 async def test_lease_renewal_keeps_live_claim_through_recovery(env):

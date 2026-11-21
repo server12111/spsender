@@ -5,9 +5,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_PATH: /srv/fe-autosender/data/fe_autosender.sqlite3
+      DATA_DIR: /app/data
     volumes:
-      - autosender_data:/srv/fe-autosender/data
+      - autosender_data:/app/data
     stop_grace_period: 30s
 volumes:
   autosender_data:

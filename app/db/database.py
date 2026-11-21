@@ -19,6 +19,8 @@ class Database:
 
     def __init__(self, path: str, busy_ms=250):
         self.path = str(Path(path).resolve())
+        if Path(self.path).is_dir():
+            raise ValueError(f"Путь базы должен указывать на файл SQLite, а DATA_DIR — на папку: {self.path}")
         self.busy_ms = busy_ms
         self._async_slots = asyncio.Semaphore(8)
         parent = Path(self.path).parent
@@ -28,7 +30,18 @@ class Database:
             os.chmod(parent, 0o700)
 
     def connect(self):
-        connection = sqlite3.connect(self.path, timeout=self.busy_ms / 1000, isolation_level=None)
+        try:
+            connection = sqlite3.connect(self.path, timeout=self.busy_ms / 1000, isolation_level=None)
+        except sqlite3.OperationalError as exc:
+            if (
+                getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_CANTOPEN
+                or "unable to open database file" in str(exc).lower()
+            ):
+                parent = Path(self.path).parent
+                exc.add_note(
+                    f"SQLite file={self.path}; каталог={parent}; существует={parent.is_dir()}; доступ записи={os.access(parent, os.W_OK)}"
+                )
+            raise
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys=ON")

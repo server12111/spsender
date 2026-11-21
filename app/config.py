@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+from app.storage import resolve_database_path
+
 
 def _env_number(kind, name, default):
     """Blank .env values fall back to the default; bad values name the variable."""
@@ -16,7 +18,7 @@ def _env_number(kind, name, default):
     try:
         return kind(raw.strip())
     except ValueError:
-        raise ValueError(f"{name}: ожидалось число, получено {raw.strip()!r}") from None
+        raise ValueError(f"{name}: ожидалось число") from None
 
 
 @dataclass(frozen=True)
@@ -74,11 +76,8 @@ class Config:
     @classmethod
     def load(cls):
         load_dotenv()
-        # Hosting convention: DATA_DIR names the persistent folder; DATABASE_PATH
-        # (absolute) still takes precedence when set explicitly.
-        default_database = os.path.join(os.getenv("DATA_DIR", "data"), "fe_autosender.sqlite3")
         config = cls(
-            database_path=os.getenv("DATABASE_PATH") or default_database,
+            database_path=resolve_database_path(),
             mode=os.getenv("MODE", "dry-run"),
             bot_token=os.getenv("BOT_TOKEN", ""),
             admin_ids=tuple(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()),
