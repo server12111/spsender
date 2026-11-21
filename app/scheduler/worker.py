@@ -55,6 +55,8 @@ class Worker:
 
     async def run_once(self):
         await self.e.db.run(self.e.recover_expired)
+        if hasattr(self.transport, "resolve_pending_targets"):
+            await self.transport.resolve_pending_targets(self.owner)
         await self.e.db.run(self.e.tick)
         worked = await self.run_batch()
         await self.e.deliver_notifications(self.sink, self.owner)
@@ -137,11 +139,22 @@ class Worker:
                         await self.e.db.run(self.e.diagnostic, "connections", exc)
                     await asyncio.sleep(self.e.config.worker_interval)
 
+            async def chat_targets():
+                while True:
+                    try:
+                        if hasattr(self.transport, "resolve_pending_targets"):
+                            await self.transport.resolve_pending_targets(self.owner)
+                            await self.e.deliver_notifications(self.sink, self.owner)
+                    except Exception as exc:
+                        await self.e.db.run(self.e.diagnostic, "chat-import", exc)
+                    await asyncio.sleep(self.e.config.worker_interval)
+
             tasks = [
                 asyncio.create_task(heartbeat()),
                 asyncio.create_task(planning()),
                 asyncio.create_task(dispatching()),
                 asyncio.create_task(listeners()),
+                asyncio.create_task(chat_targets()),
             ]
             if self.e.config.mode == "live":
                 from app.legacy.runtime import LegacyRuntime

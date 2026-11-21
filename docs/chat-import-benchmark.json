@@ -1,0 +1,17 @@
+{
+  "chat_targets": 1000,
+  "preserved_after_restart": 1000,
+  "resolved": 1000,
+  "batches": 250,
+  "checks_per_batch": 4,
+  "mock_reads": 1000,
+  "duplicates": 0,
+  "real_telegram_operations": 0,
+  "message_sends": 0,
+  "import_seconds": 5.946,
+  "import_cpu_seconds": 3.594,
+  "resolve_seconds": 25.071,
+  "resolve_cpu_seconds": 16.344,
+  "rss_mb": 74.59,
+  "process_peak_rss_mb": 74.59
+}

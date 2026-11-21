@@ -228,7 +228,7 @@ def test_migration_13_adds_pool_without_changing_old_sessions(env):
         c.execute("DELETE FROM schema_migrations WHERE version LIKE '013%'")
     e.db.migrate()
     assert e.db.all("SELECT * FROM account_sessions ORDER BY account_id") == before
-    assert e.db.scalar("SELECT count(*) FROM schema_migrations") == 13
+    assert e.db.scalar("SELECT count(*) FROM schema_migrations") == 14
     assert not e.api_pool()
 
 

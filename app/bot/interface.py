@@ -239,7 +239,14 @@ class Interface:
         if section == "pairs":
             where += " AND account_a_id IS NOT NULL AND EXISTS(SELECT 1 FROM campaigns ca "
             where += "WHERE ca.id=pairs.campaign_id AND ca.status<>'REMOVED')"
-        records = self.e.db.all(f"SELECT * FROM {table}" + where + " ORDER BY id LIMIT 9 OFFSET ?", (*args, page * 8))
+        if section == "chats":
+            table = "(SELECT id,title,status,0 AS pending FROM chat_pool UNION ALL "
+            table += "SELECT id,link AS title,status,1 AS pending FROM chat_targets "
+            table += "WHERE status NOT IN ('RESOLVED','REMOVED'))"
+        order = "id,pending" if section == "chats" else "id"
+        records = self.e.db.all(
+            f"SELECT * FROM {table}" + where + f" ORDER BY {order} LIMIT 9 OFFSET ?", (*args, page * 8)
+        )
         count = self.e.db.scalar(f"SELECT count(*) FROM {table}" + where, args)
         buttons = []
         for r in records[:8]:
@@ -264,6 +271,8 @@ class Interface:
                 "DISCONNECTED": "🔌",
                 "FROZEN": "🔴",
                 "RESTRICTED": "🔴",
+                "PENDING": "⏳",
+                "RESOLVING": "⏳",
             }.get(r[status_column], "⚠️")
             if section == "accounts" and r["paused"]:
                 status_icon = "⏸"
@@ -272,7 +281,7 @@ class Interface:
                     self.button(
                         user,
                         f"{status_icon} №{r['id']} {title[:20]}",
-                        "card",
+                        "chat_target" if r.get("pending") else "card",
                         {"section": section, "id": r["id"], "period": period},
                     )
                 ]
@@ -316,6 +325,10 @@ class Interface:
             extra += " · ".join(f"{label(k)}: {v}" for k, v in stats["health"].items())
         if section == "pairs":
             extra = "\n\n🔄 Аккаунты одной рассылки объединяются в пары автоматически."
+        if section == "chats":
+            pending = self.e.db.scalar("SELECT count(*) FROM chat_targets WHERE status IN ('PENDING','RESOLVING')")
+            if pending:
+                extra = f"\n⏳ Сохранены и ожидают проверки: {pending}. Бот проверит их автоматически, когда аккаунт будет доступен."
         if not records:
             extra += "\n\n" + (
                 "По этому фильтру ничего не найдено."
@@ -1248,6 +1261,11 @@ class Interface:
         action, data = token["action"], json.loads(token["data"])
         await self.e.db.run(self._expect_version, data)
         section, item_id = data.get("section"), data.get("id")
+        if action == "chat_target":
+            return await self.e.db.run(self.chat_target_card, user, item_id)
+        if action == "chat_target_change":
+            await self.e.db.run(self.e.change_chat_target, item_id, data["action"])
+            return await self.e.db.run(self.listing, user, "chats")
         if action == "account_import":
             await self.e.db.run(self.set_state, user, "account_import", {"name": "Импортированный"})
             return View(
@@ -1344,6 +1362,8 @@ class Interface:
                 "pairs": ("pairs", "status"),
             }
             table, col = tables[section]
+            if section == "chats":
+                table = "(SELECT status FROM chat_pool UNION ALL SELECT status FROM chat_targets WHERE status NOT IN ('RESOLVED','REMOVED'))"
             values = await self.e.db.run(self.e.db.all, f"SELECT DISTINCT {col} AS status FROM {table}")
             return View(
                 "🔽 Фильтр статуса",
@@ -1836,6 +1856,10 @@ class Interface:
                 if not await self._import_active(user, form):
                     return await self.e.db.run(self.main, user, f"Импорт отменён. Уже обработано: {count}")
                 try:
+                    if self.e.config.mode == "live":
+                        await self.e.db.run(self._import_chat_reference, user, form["_revision"], value, options)
+                        count += 1
+                        continue
                     chat_id, topic, link, title = await self.transport.resolve_target(value)
                     if not await self._import_active(user, form):
                         return await self.e.db.run(self.main, user, f"Импорт отменён. Уже обработано: {count}")
@@ -1948,6 +1972,50 @@ class Interface:
             ):
                 raise DomainError("Импорт отменён")
             return self.e._add_chat(c, chat_id, title, topic, link, **options)
+
+    def _import_chat_reference(self, user, revision, value, options):
+        with self.e.db.tx() as c:
+            state = row(c, "SELECT * FROM ui_states WHERE admin_id=? AND expires_at>?", (user, self.e.clock()))
+            if (
+                not state
+                or state["state"] != "import_confirm"
+                or json.loads(state["data"]).get("_revision") != revision
+            ):
+                raise DomainError("Импорт отменён")
+            return self.e._queue_chat_target(c, value, **options)
+
+    def chat_target_card(self, user, target_id):
+        self.e.authorize(user)
+        target = self.e.db.one("SELECT * FROM chat_targets WHERE id=?", (target_id,))
+        if not target or target["status"] == "REMOVED":
+            raise DomainError("Чат удалён")
+        if target["status"] == "RESOLVED":
+            return self.card(user, "chats", target["chat_pool_id"])
+        text = target["link"] + (f" · Тема {target['topic_id']}" if target["topic_id"] else "")
+        text += "\n\nЧат сохранён в пуле. "
+        buttons = []
+        if target["status"] == "REVIEW":
+            reasons = {
+                "NOT_A_CHAT": "Это пользователь или бот, а нужен чат.",
+                "CHAT_UNAVAILABLE": "Чат не найден или ссылка больше не действует.",
+                "PRIVATE_CHAT_REQUIRES_MEMBERSHIP": "Аккаунту нужен доступ к закрытому чату.",
+                "PUBLICATION_FORBIDDEN": "У аккаунта нет доступа к чату.",
+            }
+            text += reasons.get(target["last_error"], "Не удалось проверить чат после повторных попыток.")
+            text += " Проверьте ссылку и повторите проверку."
+            buttons.append(
+                [
+                    self.button(
+                        user, "🔄 Повторить проверку", "chat_target_change", {"id": target_id, "action": "retry"}, True
+                    )
+                ]
+            )
+        else:
+            text += "Проверка пройдёт автоматически, когда аккаунт будет доступен. Повторно добавлять чат не нужно."
+        buttons.append(
+            [self.button(user, "🗑 Удалить из пула", "chat_target_change", {"id": target_id, "action": "remove"}, True)]
+        )
+        return View(text, buttons + self.nav(user, "chats"))
 
     def import_confirmation(self, user, form):
         self.set_state(user, "import_confirm", form)

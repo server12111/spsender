@@ -31,6 +31,8 @@ LABELS = {
     "WAITING_REPLACEMENT": "Ожидает замену",
     "NEEDS_ATTENTION": "Требует внимания",
     "PENDING": "В очереди",
+    "RESOLVING": "Проверка чата",
+    "REVIEW": "Нужна проверка",
     "INFLIGHT": "Выполняется",
     "CONFIRMED": "Подтверждено",
     "FAILED": "Ошибка",

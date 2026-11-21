@@ -697,33 +697,89 @@ class TelegramTransport:
         if not await self.engine.db.run(self.engine.execution_allowed, job):
             raise OperationError("cancelled", "STATE_CHANGED_BEFORE_REQUEST")
 
-    async def resolve_target(self, value):
+    async def resolve_target(self, value, account_id=None):
         chat_id, topic, link = parse_target(value)
         if chat_id is not None:
             return chat_id, topic, link, str(chat_id)
-        account = await self.engine.db.run(
-            self.engine.db.one,
-            "SELECT * FROM accounts WHERE account_health='OK' AND paused=0 AND onboarding_started_at<=? ORDER BY id LIMIT 1",
-            (self.engine.clock() - 86400,),
-        )
+        account = await self.engine.db.run(self.engine.chat_target_account, account_id)
         if not account:
-            raise ValueError(
-                "Для определения ID по ссылке нужен подключённый аккаунт после тихого периода. Можно импортировать числовой ID"
-            )
+            raise OperationError("cancelled", "CHAT_CHECK_WAITING_ACCOUNT")
+        if hasattr(self, "_operation_semaphore"):
+            async with self._operation_semaphore:
+                lock = self._operation_locks.setdefault(account["id"], asyncio.Lock())
+                async with lock:
+                    if not await self.engine.db.run(self.engine.chat_target_account, account["id"]):
+                        raise OperationError("cancelled", "CHAT_CHECK_WAITING_ACCOUNT")
+                    return await self._resolve_chat_reference(account, topic, link)
+        return await self._resolve_chat_reference(account, topic, link)
+
+    async def _resolve_chat_reference(self, account, topic, link):
         client = await self.client(account["id"])
+        if not await self.engine.db.run(self.engine.chat_target_account, account["id"]):
+            raise OperationError("cancelled", "CHAT_CHECK_WAITING_ACCOUNT")
         if "t.me/+" in link:
             invite = await asyncio.wait_for(
                 client(functions.messages.CheckChatInviteRequest(link.rsplit("+", 1)[1])), 30
             )
             entity = getattr(invite, "chat", None)
             if not entity:
-                raise ValueError("Для закрытого чата импортируйте числовой ID; вступление при импорте не выполняется")
+                raise OperationError("manual", "PRIVATE_CHAT_REQUIRES_MEMBERSHIP")
         else:
-            entity = await asyncio.wait_for(client.get_entity(link), 30)
+            try:
+                entity = await asyncio.wait_for(client.get_entity(link), 30)
+            except ValueError:
+                raise OperationError("chat", "CHAT_UNAVAILABLE") from None
         if not isinstance(entity, (types.Chat, types.Channel)):
-            raise ValueError("В пул разрешено добавлять только группы / каналы")
+            raise OperationError("chat", "NOT_A_CHAT")
         await self._remember_peer(account["id"], entity)
         return utils.get_peer_id(entity), topic, link, entity.title
+
+    async def resolve_pending_targets(self, owner, limit=4):
+        """Bounded read-only checks. Imports need neither a session nor a socket."""
+        now = self.engine.clock()
+        pending = await self.engine.db.run(
+            self.engine.db.scalar,
+            "SELECT 1 FROM chat_targets WHERE approved=1 AND "
+            "((status='PENDING' AND next_attempt_at<=?) OR (status='RESOLVING' AND lease_until<=?)) LIMIT 1",
+            (now, now),
+        )
+        if not pending:
+            return 0
+        account = await self.engine.db.run(self.engine.chat_target_account)
+        if not account:
+            return 0
+        completed = 0
+        options = await self.engine.db.run(self.engine.runtime_options)
+        for _ in range(min(4, options["batch_size"], max(0, limit))):
+            if not await self.engine.db.run(self.engine.chat_target_account, account["id"]):
+                break
+            target = await self.engine.db.run(self.engine.claim_chat_target, owner)
+            if not target:
+                break
+            value = target["link"] + (f"/{target['topic_id']}" if target["topic_id"] else "")
+            try:
+                # The complete admission/lock/connect/read phase is shorter
+                # than the claim lease. These RPCs cannot send messages.
+                result = await asyncio.wait_for(self.resolve_target(value, account["id"]), 90)
+                completed += bool(await self.engine.db.run(self.engine.finish_chat_target, target, result))
+            except Exception as exc:
+                error = classify_error(exc)
+                if error.category == "critical":
+                    await self.engine.db.run(self.engine.critical, account["id"], error.code)
+                elif error.category == "flood":
+                    await self.engine.db.run(self.engine.flood_wait, account["id"], error.seconds)
+                await self.engine.db.run(self.engine.fail_chat_target, target, error)
+                await self.engine.db.run(
+                    self.engine.diagnostic,
+                    "chat-check",
+                    error,
+                    account_id=account["id"],
+                    target_id=target["id"],
+                    reason=error.code,
+                )
+                if error.category in {"critical", "flood", "cancelled"}:
+                    break
+        return completed
 
     async def _disconnect_client(self, account_id, client, timeout=5):
         if not hasattr(self, "_retiring"):

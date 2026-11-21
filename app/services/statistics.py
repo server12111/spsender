@@ -112,6 +112,13 @@ class Statistics:
                 )
                 statuses[table] = {r["status"]: r["value"] for r in values}
                 totals[table] = sum(r["value"] for r in values)
+            for target in rows(
+                c,
+                "SELECT status,count(*) AS value FROM chat_targets "
+                "WHERE status NOT IN ('RESOLVED','REMOVED') GROUP BY status",
+            ):
+                statuses["chat_pool"][target["status"]] = target["value"]
+                totals["chat_pool"] += target["value"]
             account_summary = row(
                 c,
                 "SELECT COALESCE(sum(onboarding_stage<>'READY' AND account_health<>'REMOVED'),0) AS preparing, COALESCE(sum(onboarding_stage='READY' AND account_health='OK' AND paused=0),0) AS ready, COALESCE(sum(paused=1 AND account_health<>'REMOVED'),0) AS paused_accounts FROM accounts",

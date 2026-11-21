@@ -3,6 +3,7 @@ from .api_pool import ApiPool
 from .autoresponders import Autoresponders
 from .campaigns import Campaigns
 from .chat_pool import ChatPool
+from .chat_targets import ChatTargets
 from .core import Core, DomainError
 from .dispatch import Dispatch
 from .dm_sequences import DMSequences
@@ -22,6 +23,7 @@ class Engine(
     Campaigns,
     Pairs,
     ChatPool,
+    ChatTargets,
     Onboarding,
     Dispatch,
     Greetings,
