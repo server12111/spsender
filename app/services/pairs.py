@@ -74,6 +74,10 @@ class Pairs:
                 state = "NEEDS_ATTENTION"
             elif any(a["onboarding_stage"] != "READY" for a in accounts):
                 state = "PREPARING"
+                if all(a["prepared_at"] for a in accounts) and not row(
+                    c, "SELECT 1 FROM pair_chats WHERE pair_id=? AND removed_at IS NULL", (pair["id"],)
+                ):
+                    state = "WAITING_REPLACEMENT" if pair["status"] == "WAITING_REPLACEMENT" else "WAITING_CHATS"
             else:
                 state = "PAUSED"
         else:

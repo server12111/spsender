@@ -368,6 +368,8 @@ class Interface:
             return "Ожидает второго аккаунта в рассылке"
         if account["manual_required"]:
             return "Нужна ручная проверка чата"
+        if not account["has_approved_chat"]:
+            return "Пара ждёт разрешённых чатов из пула"
         if account["onboarding_stage"] == "READY":
             return "Подготовка завершена"
         if account["onboarding_stage"] == "SILENT_24H":
@@ -382,7 +384,9 @@ class Interface:
             "SELECT a.*,m.campaign_id,ca.status AS campaign_status,p.account_b_id,"
             "EXISTS(SELECT 1 FROM dispatch_jobs j WHERE j.pair_id=p.id AND j.status='UNKNOWN') AS uncertain,"
             "EXISTS(SELECT 1 FROM account_chat_access ac JOIN pair_chats pc ON pc.chat_pool_id=ac.chat_pool_id "
-            "WHERE ac.account_id=a.id AND pc.pair_id=p.id AND pc.removed_at IS NULL AND ac.manual_required=1) AS manual_required "
+            "WHERE ac.account_id=a.id AND pc.pair_id=p.id AND pc.removed_at IS NULL AND ac.manual_required=1) AS manual_required,"
+            "EXISTS(SELECT 1 FROM pair_chats pc JOIN chat_pool cp ON cp.id=pc.chat_pool_id "
+            "WHERE pc.pair_id=p.id AND pc.removed_at IS NULL AND pc.status='ASSIGNED' AND cp.approved=1) AS has_approved_chat "
             "FROM accounts a LEFT JOIN campaign_members m ON m.account_id=a.id "
             "LEFT JOIN campaigns ca ON ca.id=m.campaign_id "
             "LEFT JOIN pairs p ON p.account_a_id=a.id OR p.account_b_id=a.id "
@@ -657,14 +661,24 @@ class Interface:
             if pair:
                 card = self.e.pair_card(pair["id"])
                 shift = (
-                    ("На смене" if card["active_account_id"] == item_id else "Вне смены")
+                    ("Смена по расписанию" if card["active_account_id"] == item_id else "Вне смены по расписанию")
                     if pair["account_b_id"]
                     else "Ожидает партнёра"
                 )
                 n = len(card["chats"])
             text = f"👤 №{item_id} · {r['name']}\n{r['phone_mask']} · Telegram ID: {r['telegram_id'] or '—'}\n"
             text += f"Рассылка: {member['name'] if member else 'Свободный пул'} · Пара: №{pair['id'] if pair else '—'}\n{shift} · Общих чатов: {n}\n"
-            text += f"Подготовка: {label(r['onboarding_stage'])}\nНа этапе: {max(0, int((self.e.clock() - r['stage_started_at']) // 3600))} ч\nСостояние: {label(r['account_health'])} · {'На паузе' if r['paused'] else 'Включён'}"
+            preparation = label(r["onboarding_stage"])
+            if (
+                pair
+                and pair["account_b_id"]
+                and not n
+                and member
+                and member["status"] == "RUNNING"
+                and r["prepared_at"]
+            ):
+                preparation = "Пара ждёт разрешённых чатов из пула"
+            text += f"Подготовка: {preparation}\nНа этапе: {max(0, int((self.e.clock() - r['stage_started_at']) // 3600))} ч\nСостояние: {label(r['account_health'])} · {'На паузе' if r['paused'] else 'Включён'}"
             client = getattr(self.transport, "clients", {}).get(item_id)
             if self.e.config.mode == "dry-run":
                 connection = "тестовый режим, подключения нет"

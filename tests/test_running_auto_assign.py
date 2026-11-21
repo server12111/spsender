@@ -1,6 +1,9 @@
 import pytest
+from conftest import restart, setup_pair
 from test_bot import Harness
 
+from app.bot.interface import Interface
+from app.legacy.mailing_database import LegacyMailingDatabase
 from app.scheduler.worker import Worker
 from app.transport.authorization import AuthorizedSession
 
@@ -72,3 +75,39 @@ def test_no_campaign_leaves_account_in_free_pool(env):
     e, _, _, _ = env
     account, choices = e.add_account("A", "+380111111111", "session-a", 1001)
     assert not choices and not e.db.scalar("SELECT count(*) FROM campaign_members WHERE account_id=?", (account,))
+
+
+async def test_later_pair_waits_for_its_own_chat_and_continues_automatically(env):
+    e, clock, api, sink = env
+    target, first_pair, _, _, existing_chats = setup_pair(e, 1)
+    a, _ = e.add_account("New A", "+380333333333", "session-c", 1003)
+    b, _ = e.add_account("New B", "+380444444444", "session-d", 1004)
+    pair = e.db.one("SELECT * FROM pairs WHERE account_a_id=?", (a,))
+    assert (pair["campaign_id"], pair["account_b_id"]) == (target, b)
+    assert not e.pair_card(pair["id"])["chats"]
+
+    clock.advance(28 * 3600)
+    worker = Worker(e, api, sink)
+    await worker.run_once()
+    await worker.run_once()
+    assert e.db.all("SELECT onboarding_stage,joined_at FROM accounts WHERE id IN (?,?)", (a, b)) == [
+        {"onboarding_stage": "PREPARING", "joined_at": None},
+        {"onboarding_stage": "PREPARING", "joined_at": None},
+    ]
+    assert e.pair_card(pair["id"])["status"] == "WAITING_CHATS"
+    ui = Interface(e, api)
+    assert ui.preparation(123).text.count("Пара ждёт разрешённых чатов из пула") == 2
+    assert "Пара ждёт разрешённых чатов из пула" in ui.card(123, "accounts", a).text
+    assert {op["kind"] for op in api.calls if op["account_id"] in {a, b}} == {"CHECK"}
+
+    e = restart(e)
+    added = e.add_chat(-1009876, "Approved new chat", approved=True, join_allowed=True)
+    worker = Worker(e, api, sink)
+    await worker.run_once()
+    await worker.run_once()
+    assert e.pair_card(first_pair)["chats"][0]["chat_pool_id"] == existing_chats[0]
+    assert e.pair_card(pair["id"])["status"] == "READY"
+    assert e.pair_card(pair["id"])["chats"][0]["chat_pool_id"] == added
+    joined = [op for op in api.calls if op["kind"] == "JOIN" and op["chat_pool_id"] == added]
+    assert sorted(op["account_id"] for op in joined) == [a, b]
+    assert len(await LegacyMailingDatabase(e).get_mailing_targets(pair["id"])) == 1

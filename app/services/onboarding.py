@@ -43,6 +43,7 @@ class Onboarding:
             if not incomplete and not greeting_needed:
                 return
         chats = self._assigned_chats(c, pair["id"])
+        has_approved_chat = any(chat["status"] == "ASSIGNED" and chat["approved"] for chat in chats)
         access_map = {
             (a["account_id"], a["chat_pool_id"]): a
             for a in rows(
@@ -68,7 +69,7 @@ class Onboarding:
             if not account["prepared_at"]:
                 self._enqueue(c, pair, campaign, "CHECK", None, account["id"], {}, f"prepare:{account['id']}")
                 continue
-            if age < 25 * 3600 or not pair["account_b_id"]:
+            if age < 25 * 3600 or not pair["account_b_id"] or not has_approved_chat:
                 continue
             incomplete = []
             for chat in chats:
@@ -121,7 +122,7 @@ class Onboarding:
                 self._stage(c, account, "GREETING_READY")
         # Greetings are pair-wide and use the same persisted progress for both stages.
         accounts = self._pair_accounts(c, pair)
-        if not all(
+        if not has_approved_chat or not all(
             a and a["prepared_at"] and a["joined_at"] and now - a["onboarding_started_at"] >= 26 * 3600
             for a in accounts
         ):
